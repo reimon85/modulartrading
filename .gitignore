@@ -5,6 +5,13 @@
 data/*.parquet
 data/*.db
 data/*.sqlite
+data/*.html
+
+# Claude Code
+.claude/
+
+# Notes
+*.ini
 
 # Python
 __pycache__/
