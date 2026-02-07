@@ -18,6 +18,7 @@ import asyncio
 import sys
 
 from src.config import setup_logging
+from src.database import RedisManager
 from src.fetcher import ExchangeClient, fetch_funding_rate, fetch_ohlcv, fetch_spread
 from src.storage import save_parquet, save_sqlite
 from src.utils import enrich
@@ -29,9 +30,11 @@ logger = setup_logging()
 
 async def run(args: argparse.Namespace) -> None:
     client = ExchangeClient()
+    redis_mgr = RedisManager()
 
     try:
         await client.connect()
+        await redis_mgr.connect()
 
         # Time range
         now_ms = int(pd.Timestamp.now("UTC").timestamp() * 1000)
@@ -57,14 +60,38 @@ async def run(args: argparse.Namespace) -> None:
         # 3. Enrich with IA-ready features -------------------------------
         df = enrich(df, funding_rate=funding_rate, spread_info=spread_info)
 
-        # 4. Persist -----------------------------------------------------
+        # 4. Persist to Parquet + SQLite ---------------------------------
         await save_parquet(df, symbol=args.symbol, timeframe=args.timeframe)
         await save_sqlite(df, symbol=args.symbol, timeframe=args.timeframe)
 
-        logger.info("Pipeline complete — %d enriched bars stored", len(df))
+        # 5. Push to Redis -----------------------------------------------
+        # 5a. Store last 100 candles in Sorted Set
+        last_100 = df.tail(100)
+        candles = last_100[["timestamp", "open", "high", "low", "close", "volume"]].to_dict("records")
+        await redis_mgr.store_candles(candles, timeframe=args.timeframe)
+
+        # 5b. Publish latest tick via Hash + Pub/Sub
+        latest = df.iloc[-1]
+        tick = {
+            "symbol": args.symbol,
+            "price": float(latest["close"]),
+            "open": float(latest["open"]),
+            "high": float(latest["high"]),
+            "low": float(latest["low"]),
+            "close": float(latest["close"]),
+            "volume": float(latest["volume"]),
+            "funding_rate": funding_rate,
+            "timestamp": int(latest["timestamp"]),
+        }
+        if spread_info:
+            tick.update(spread_info)
+        await redis_mgr.publish_tick(tick)
+
+        logger.info("Pipeline complete — %d enriched bars stored + Redis updated", len(df))
 
     finally:
         await client.close()
+        await redis_mgr.disconnect()
 
 
 def main() -> None:

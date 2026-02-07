@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -53,7 +54,45 @@ async def save_parquet(
         tmp_path.unlink(missing_ok=True)
         raise
 
+    # Daily archive: data/archive/BTC_USDT_1m_2026-02-07.parquet
+    _create_daily_archive(df, safe_symbol, timeframe, directory)
+
     return target
+
+
+def _create_daily_archive(
+    df: pd.DataFrame,
+    safe_symbol: str,
+    timeframe: str,
+    base_dir: Path,
+    retention_days: int = 30,
+) -> None:
+    """Create a daily Parquet snapshot and clean up archives older than retention_days."""
+    archive_dir = base_dir / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    archive_path = archive_dir / f"{safe_symbol}_{timeframe}_{today}.parquet"
+
+    if not archive_path.exists():
+        try:
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            pq.write_table(table, archive_path, compression="snappy")
+            logger.info("Daily archive → %s (%d rows)", archive_path.name, len(df))
+        except Exception as exc:
+            logger.warning("Failed to create daily archive: %s", exc)
+
+    # Cleanup archives older than retention_days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    for old_file in archive_dir.glob(f"{safe_symbol}_{timeframe}_*.parquet"):
+        try:
+            date_str = old_file.stem.rsplit("_", 1)[-1]
+            file_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if file_date < cutoff:
+                old_file.unlink()
+                logger.info("Deleted old archive: %s", old_file.name)
+        except (ValueError, OSError):
+            pass
 
 
 # ---------------------------------------------------------------------------

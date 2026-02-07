@@ -48,6 +48,29 @@ MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 RATE_LIMIT_MS: int = int(os.getenv("RATE_LIMIT_MS", "100"))
 
 # ---------------------------------------------------------------------------
+# Redis
+# ---------------------------------------------------------------------------
+REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+REDIS_MAX_CONNECTIONS: int = int(os.getenv("REDIS_MAX_CONNECTIONS", "10"))
+REDIS_URL: str = f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+
+# ---------------------------------------------------------------------------
+# Hyperliquid DEX
+# ---------------------------------------------------------------------------
+HL_PRIVATE_KEY: str = os.getenv("HL_PRIVATE_KEY", "")
+HL_WALLET_ADDRESS: str = os.getenv("HL_WALLET_ADDRESS", "")
+HL_MAINNET: bool = os.getenv("HL_MAINNET", "false").lower() == "true"
+HL_DEFAULT_LEVERAGE: int = int(os.getenv("HL_DEFAULT_LEVERAGE", "1"))
+HL_POSITION_FRAC: float = float(os.getenv("HL_POSITION_FRAC", "0.10"))
+HL_LIMIT_OFFSET_BPS: float = float(os.getenv("HL_LIMIT_OFFSET_BPS", "5"))
+HL_LIMIT_WAIT_SEC: int = int(os.getenv("HL_LIMIT_WAIT_SEC", "10"))
+HL_SIGNAL_CHANNEL: str = os.getenv("HL_SIGNAL_CHANNEL", "trading_signals")
+HL_STATE_POLL_SEC: int = int(os.getenv("HL_STATE_POLL_SEC", "10"))
+
+# ---------------------------------------------------------------------------
 # Storage paths
 # ---------------------------------------------------------------------------
 DATA_DIR: Path = _PROJECT_ROOT / os.getenv("DATA_DIR", "data")
@@ -78,8 +101,10 @@ def setup_logging() -> logging.Logger:
         ch.setFormatter(fmt)
         logger.addHandler(ch)
 
-        # File handler (optional, inside data/)
-        fh = logging.FileHandler(DATA_DIR / "fetcher.log")
+        # Rotating file handler (daily, 7-day retention)
+        from src.log_rotation import create_rotating_handler
+
+        fh = create_rotating_handler(DATA_DIR / "fetcher.log")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 
