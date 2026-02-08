@@ -198,6 +198,8 @@ class BacktestEngine:
         commission_pct: float = 0.1,
         position_frac: float = 1.0,
         timeframe: str = "1m",
+        tp_points: float = 0.0,
+        sl_points: float = 0.0,
     ):
         """
         Args:
@@ -207,6 +209,8 @@ class BacktestEngine:
             commission_pct:  comisión por operación en % (0.1 = Binance spot)
             position_frac:   fracción del cash a invertir por operación (1.0 = 100%)
             timeframe:       para anualizar Sharpe/Sortino
+            tp_points:       Take Profit en puntos de precio (0 = desactivado)
+            sl_points:       Stop Loss en puntos de precio (0 = desactivado)
         """
         self.strategy_cls = strategy_cls
         self.data = data.copy()
@@ -214,6 +218,8 @@ class BacktestEngine:
         self.commission = commission_pct / 100.0
         self.position_frac = position_frac
         self.timeframe = timeframe
+        self.tp_points = tp_points
+        self.sl_points = sl_points
 
     def run(self, params: dict) -> BacktestResult:
         """Ejecutar un backtest con los parámetros dados."""
@@ -251,6 +257,40 @@ class BacktestEngine:
             ts = int(row["timestamp"])
 
             if i >= start:
+                # ── TP / SL CHECK (prioridad sobre señales) ───
+                if active_trade is not None:
+                    hi = float(row["high"])
+                    lo = float(row["low"])
+
+                    tp_hit = self.tp_points > 0 and hi >= active_trade.entry_price + self.tp_points
+                    sl_hit = self.sl_points > 0 and lo <= active_trade.entry_price - self.sl_points
+
+                    if tp_hit or sl_hit:
+                        exit_px = (
+                            (active_trade.entry_price + self.tp_points) if tp_hit
+                            else (active_trade.entry_price - self.sl_points)
+                        )
+                        revenue = holdings * exit_px
+                        fee = revenue * self.commission
+                        net = revenue - fee
+
+                        active_trade.exit_bar = i
+                        active_trade.exit_timestamp = ts
+                        active_trade.exit_price = exit_px
+                        active_trade.pnl = net - active_trade.invested
+                        active_trade.pnl_pct = (net / active_trade.invested - 1) * 100
+                        active_trade.commission_paid += fee
+                        active_trade.bars_held = i - active_trade.entry_bar
+
+                        trades.append(active_trade)
+                        cash += net
+                        holdings = 0.0
+                        active_trade = None
+
+                        equity_curve.append(cash)
+                        timestamps.append(ts)
+                        continue
+
                 signal = strategy.check_signal(df, i)
 
                 # ── ABRIR LONG ─────────────────────────────────

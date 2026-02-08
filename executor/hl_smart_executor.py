@@ -44,6 +44,8 @@ import redis.asyncio as aioredis
 # ── Project imports ─────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import config  # noqa: E402
+from src.database.trade_journal import TradeJournal  # noqa: E402
+from src.notifier import AlertLevel, TelegramNotifier  # noqa: E402
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
@@ -122,7 +124,7 @@ class HLClient:
 
     async def get_balance(self) -> float:
         if self.dry_run:
-            return 10_000.0
+            return 100_000.0
         state = await asyncio.to_thread(self._info.user_state, self.address)
         return float(state["marginSummary"]["accountValue"])
 
@@ -231,12 +233,23 @@ class PositionState:
     tp_target_ts: int = 0    # epoch ms (solo para TIME)
     entry_ts: int = 0        # epoch ms
     status: str = "OPEN"
+    entries: list = field(default_factory=list)   # [{"price": float, "size": float, "ts": int}]
+    max_entries: int = 4
+    entry_size: float = 1.0
+    trade_id: int = 0
 
     def to_redis(self) -> dict[str, str]:
-        return {k: str(v) for k, v in asdict(self).items()}
+        d = {k: str(v) for k, v in asdict(self).items() if k != "entries"}
+        d["entries"] = json.dumps(self.entries)
+        return d
 
     @classmethod
     def from_redis(cls, data: dict[str, str]) -> PositionState:
+        entries_raw = data.get("entries", "[]")
+        try:
+            entries = json.loads(entries_raw)
+        except (json.JSONDecodeError, TypeError):
+            entries = []
         return cls(
             coin=data["coin"], action=data["action"],
             entry_price=float(data["entry_price"]),
@@ -249,6 +262,10 @@ class PositionState:
             tp_target_ts=int(data.get("tp_target_ts", 0) or 0),
             entry_ts=int(data.get("entry_ts", 0) or 0),
             status=data.get("status", "OPEN"),
+            entries=entries,
+            max_entries=int(data.get("max_entries", 4) or 4),
+            entry_size=float(data.get("entry_size", 1.0) or 1.0),
+            trade_id=int(data.get("trade_id", 0) or 0),
         )
 
 
@@ -312,6 +329,8 @@ class HLSmartExecutor:
         self.positions: dict[str, PositionState] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._redis: aioredis.Redis | None = None
+        self._journal = TradeJournal()
+        self._notifier = TelegramNotifier()
         self._running = True
 
     # ── Lifecycle ──────────────────────────────────────────────
@@ -324,6 +343,9 @@ class HLSmartExecutor:
         self._redis = aioredis.Redis(connection_pool=pool)
         await self._redis.ping()
         logger.info("Redis conectado")
+
+        await self._journal.connect()
+        await self._notifier.connect()
 
         await self._resume_positions()
 
@@ -344,6 +366,8 @@ class HLSmartExecutor:
         for name, task in self._tasks.items():
             task.cancel()
             logger.info("Task cancelada: %s", name)
+        await self._journal.disconnect()
+        await self._notifier.disconnect()
         if self._redis:
             await self._redis.aclose()
         logger.info("Executor detenido")
@@ -363,6 +387,11 @@ class HLSmartExecutor:
                 continue
             try:
                 signal = json.loads(msg["data"])
+                # Filtro: ignorar señales destinadas a otro exchange
+                exchange = signal.get("exchange", "").upper()
+                if exchange and exchange not in ("", "HL", "HYPERLIQUID", "ALL"):
+                    logger.debug("Signal skip (exchange=%s, esperado HL)", exchange)
+                    continue
                 logger.info("SIGNAL recibida: %s", json.dumps(signal, indent=None))
                 await self._dispatch(signal)
             except json.JSONDecodeError:
@@ -389,35 +418,42 @@ class HLSmartExecutor:
         sl_price = float(signal["sl_price"])
         tp_type = signal.get("tp_type", "PRICE").upper()
         tp_value = float(signal.get("tp_value", 0))
+        entry_size = float(signal.get("size", config.STRATEGY_ENTRY_SIZE_BTC))
+        max_entries = int(signal.get("max_entries", config.STRATEGY_MAX_ENTRIES))
         side = "LONG" if is_buy else "SHORT"
 
         logger.info("=" * 60)
-        logger.info("ABRIENDO %s %s | mult=%.1f | SL=$%,.2f | TP(%s)=%s",
-                     side, coin, multiplier, sl_price, tp_type,
-                     f"${tp_value:,.2f}" if tp_type == "PRICE" else _fmt_duration(tp_value))
+        logger.info("ABRIENDO %s %s | SL=$%.2f | TP(%s)=%s | size=%.4f",
+                     side, coin, sl_price, tp_type,
+                     f"${tp_value:,.2f}" if tp_type == "PRICE" else _fmt_duration(tp_value),
+                     entry_size)
 
-        # 1. Verificar que no hay posición activa en este par
+        # 1. Re-entry check: if position already exists, delegate
         if coin in self.positions:
-            logger.warning("Ya existe posición activa en %s — ignorando", coin)
+            await self._handle_reentry(signal)
             return
 
         # 2. Validar saldo
         balance = await self.client.get_balance()
-        required = balance * config.HL_POSITION_FRAC * multiplier
-        if required > balance:
-            logger.error("Saldo insuficiente: necesario=$%,.2f, disponible=$%,.2f", required, balance)
+        mid_price = await self.client.get_mid_price(coin)
+        required_usd = entry_size * mid_price
+        if required_usd > balance:
+            logger.error("Saldo insuficiente: necesario=$%.2f, disponible=$%.2f", required_usd, balance)
+            await self._notifier.notify(
+                AlertLevel.WARNING, f"Saldo insuficiente para {coin}",
+                f"  Necesario: ${required_usd:,.2f}\n  Disponible: ${balance:,.2f}",
+                source="Hyperliquid",
+            )
             return
-        logger.info("  Balance: $%,.2f | Inversión: $%,.2f (%.0f%% x %.1f)",
-                     balance, required, config.HL_POSITION_FRAC * 100, multiplier)
+        logger.info("  Balance: $%.2f | Entry size: %.4f %s ($%.2f)",
+                     balance, entry_size, coin, required_usd)
 
         # 3. Set leverage
         leverage = max(1, int(multiplier))
         await self.client.set_leverage(coin, leverage)
 
-        # 4. Calcular tamaño
-        mid_price = await self.client.get_mid_price(coin)
-        size = required / mid_price
-        size = round(size, self.client._sz(coin))
+        # 4. Tamaño de la orden
+        size = round(entry_size, self.client._sz(coin))
 
         if size <= 0:
             logger.error("Tamaño calculado = 0 — abortando")
@@ -427,10 +463,14 @@ class HLSmartExecutor:
         entry = await self._place_entry(coin, is_buy, size, mid_price)
         if not entry:
             logger.error("ENTRADA FALLIDA — abortando operación")
+            await self._notifier.notify(
+                AlertLevel.CRITICAL, f"Entrada FALLIDA {side} {coin}",
+                f"  Size: {size} | Mid: ${mid_price:,.2f}", source="Hyperliquid",
+            )
             return
 
         entry_price = entry["price"]
-        logger.info("  Entrada ejecutada: %s @ $%,.2f (%s)", side, entry_price, entry["type"])
+        logger.info("  Entrada ejecutada: %s @ $%.2f (%s)", side, entry_price, entry["type"])
 
         # 6. Stop Loss (trigger nativo)
         sl_result = await self.client.trigger_order(coin, not is_buy, size, sl_price, "sl")
@@ -443,7 +483,7 @@ class HLSmartExecutor:
         if tp_type == "PRICE" and tp_value > 0:
             tp_result = await self.client.trigger_order(coin, not is_buy, size, tp_value, "tp")
             tp_oid = _extract_oid(tp_result) or 0
-            logger.info("  TP PRECIO colocado @ $%,.2f", tp_value)
+            logger.info("  TP PRECIO colocado @ $%.2f", tp_value)
 
         elif tp_type == "TIME" and tp_value > 0:
             tp_target_ts = _ts_now() + int(tp_value * 60 * 1000)
@@ -453,6 +493,7 @@ class HLSmartExecutor:
                          _fmt_duration(tp_value), f"{tp_value:.0f} min", _fmt_ts(tp_target_ts))
 
         # 8. Guardar estado
+        first_entry = {"price": entry_price, "size": size, "ts": _ts_now()}
         state = PositionState(
             coin=coin, action=signal["action"].upper(),
             entry_price=entry_price, size=size,
@@ -460,11 +501,111 @@ class HLSmartExecutor:
             tp_type=tp_type, tp_value=tp_value,
             tp_oid=tp_oid, tp_target_ts=tp_target_ts,
             entry_ts=_ts_now(),
+            entries=[first_entry],
+            max_entries=max_entries,
+            entry_size=entry_size,
         )
         self.positions[coin] = state
+
+        # Journal: log open
+        state.trade_id = await self._journal.log_open(
+            exchange="hyperliquid", coin=coin, action=signal["action"].upper(),
+            entry_price=entry_price, size=size,
+            sl_price=sl_price, tp_type=tp_type, tp_value=tp_value,
+        )
+
         await self._save_to_redis(coin, state)
 
-        logger.info("  Posición %s registrada y monitorizada", coin)
+        await self._notifier.notify_trade(
+            f"OPEN {side}", coin, entry_price, size,
+            sl_price=sl_price, tp_type=tp_type, tp_value=tp_value,
+            source="Hyperliquid",
+        )
+
+        logger.info("  Posición %s registrada y monitorizada (journal #%d)", coin, state.trade_id)
+        logger.info("=" * 60)
+
+    # ── RE-ENTRY ────────────────────────────────────────────────
+
+    async def _handle_reentry(self, signal: dict) -> None:
+        """Añade una entrada adicional a una posición ya abierta."""
+        pair = signal["pair"]
+        coin = pair.split("/")[0]
+        state = self.positions[coin]
+        is_buy = signal["action"].upper() == "BUY"
+
+        # Validar misma dirección
+        if signal["action"].upper() != state.action:
+            logger.warning("Re-entry rechazado: señal %s vs posición %s", signal["action"], state.action)
+            return
+
+        # Validar max entries
+        if len(state.entries) >= state.max_entries:
+            logger.warning("Re-entry rechazado: max entries alcanzado (%d/%d)", len(state.entries), state.max_entries)
+            return
+
+        entry_num = len(state.entries) + 1
+        logger.info("RE-ENTRY #%d/%d para %s %s (size=%.4f)",
+                     entry_num, state.max_entries, state.action, coin, state.entry_size)
+
+        # 1. Cancelar SL trigger existente (se recolocará con tamaño total)
+        if state.sl_oid:
+            await self.client.cancel_order(coin, state.sl_oid)
+
+        # 2. Ejecutar entrada adicional (limit → market fallback)
+        mid_price = await self.client.get_mid_price(coin)
+        size = round(state.entry_size, self.client._sz(coin))
+        entry = await self._place_entry(coin, is_buy, size, mid_price)
+        if not entry:
+            logger.error("Re-entry FALLIDA — restaurando SL original")
+            await self._notifier.notify(
+                AlertLevel.WARNING, f"Re-entry #{entry_num} FALLIDA {coin}",
+                f"  Size: {size} | Mid: ${mid_price:,.2f}", source="Hyperliquid",
+            )
+            # Restaurar SL con tamaño actual
+            sl_result = await self.client.trigger_order(coin, not is_buy, state.size, state.sl_price, "sl")
+            state.sl_oid = _extract_oid(sl_result) or 0
+            await self._save_to_redis(coin, state)
+            return
+
+        entry_price = entry["price"]
+        logger.info("  Re-entry ejecutada: %s @ $%.2f (%s)", state.action, entry_price, entry["type"])
+
+        # 3. Actualizar estado
+        new_entry = {"price": entry_price, "size": size, "ts": _ts_now()}
+        state.entries.append(new_entry)
+        state.size = round(state.size + size, self.client._sz(coin))
+
+        # Recalcular entry_price promedio ponderado
+        total_cost = sum(e["price"] * e["size"] for e in state.entries)
+        total_size = sum(e["size"] for e in state.entries)
+        state.entry_price = total_cost / total_size if total_size > 0 else entry_price
+
+        # 4. Colocar nuevo SL trigger para tamaño TOTAL
+        sl_result = await self.client.trigger_order(coin, not is_buy, state.size, state.sl_price, "sl")
+        state.sl_oid = _extract_oid(sl_result) or 0
+
+        # 5. Si TP es PRICE, cancelar y recolocar con tamaño total
+        if state.tp_type == "PRICE" and state.tp_oid:
+            await self.client.cancel_order(coin, state.tp_oid)
+            tp_result = await self.client.trigger_order(coin, not is_buy, state.size, state.tp_value, "tp")
+            state.tp_oid = _extract_oid(tp_result) or 0
+
+        # 6. Journal: log reentry
+        if state.trade_id:
+            await self._journal.log_reentry(state.trade_id, entry_price, size)
+
+        # 7. Guardar estado actualizado
+        await self._save_to_redis(coin, state)
+
+        await self._notifier.notify_trade(
+            f"RE-ENTRY #{len(state.entries)}", coin, entry_price, size,
+            sl_price=state.sl_price, tp_type=state.tp_type, tp_value=state.tp_value,
+            source="Hyperliquid",
+        )
+
+        logger.info("  Posición actualizada: entries=%d/%d | total_size=%.4f | avg_entry=$%.2f",
+                     len(state.entries), state.max_entries, state.size, state.entry_price)
         logger.info("=" * 60)
 
     # ── CLOSE POSITION ─────────────────────────────────────────
@@ -522,8 +663,16 @@ class HLSmartExecutor:
         else:
             pnl_pct = (state.entry_price / mid - 1) * 100
 
-        logger.info("  Cierre: razón=%s | entry=$%,.2f | exit~=$%,.2f | PnL~=%.2f%%",
+        logger.info("  Cierre: razón=%s | entry=$%.2f | exit~=$%.2f | PnL~=%.2f%%",
                      reason, state.entry_price, mid, pnl_pct)
+
+        # Journal: log close
+        if state.trade_id:
+            await self._journal.log_close(state.trade_id, mid, reason)
+
+        await self._notifier.notify_pnl(
+            coin, state.entry_price, mid, pnl_pct, reason, source="Hyperliquid",
+        )
 
         # Limpiar
         del self.positions[coin]
@@ -575,6 +724,10 @@ class HLSmartExecutor:
             return {"price": mid_price, "type": "MARKET"}
         except Exception as exc:
             logger.error("  MARKET order también falló: %s", exc)
+            await self._notifier.notify(
+                AlertLevel.CRITICAL, f"MARKET order fallida {coin}",
+                f"  Error: {exc}", source="Hyperliquid",
+            )
             return None
 
     # ── TP TIME MONITOR (loop cada 60s) ────────────────────────
@@ -619,17 +772,40 @@ class HLSmartExecutor:
         """
         Monitorea posiciones activas en Hyperliquid.
 
-        Si una posición desaparece (SL ejecutado por el exchange),
-        limpia timers internos y estado en Redis.
+        - Cada ciclo: si posición desaparece → cierre externo → limpiar + journal
+        - Cada N ciclos: reconciliación de tamaño exchange vs local
         """
         logger.info("State monitor activo (poll cada %ds)", config.HL_STATE_POLL_SEC)
+        reconcile_every = max(1, config.RECONCILE_INTERVAL_SEC // config.HL_STATE_POLL_SEC)
+        cycle = 0
 
         while self._running:
+            cycle += 1
             try:
                 for coin in list(self.positions.keys()):
                     pos = await self.client.get_position(coin)
+                    state = self.positions.get(coin)
+                    if not state:
+                        continue
+
                     if pos is None or float(pos.get("szi", 0)) == 0:
                         logger.info("[MONITOR] Posición %s cerrada externamente (SL hit?)", coin)
+
+                        mid = await self.client.get_mid_price(coin)
+
+                        # Journal: log external close
+                        if state.trade_id:
+                            await self._journal.log_close(state.trade_id, mid, "EXTERNAL")
+
+                        # PnL for notification
+                        if state.action == "BUY":
+                            pnl_pct = (mid / state.entry_price - 1) * 100
+                        else:
+                            pnl_pct = (state.entry_price / mid - 1) * 100
+                        await self._notifier.notify_pnl(
+                            coin, state.entry_price, mid, pnl_pct,
+                            "EXTERNAL", source="Hyperliquid",
+                        )
 
                         # Cancelar timer de TP si existe
                         task_key = f"tp_{coin}"
@@ -638,9 +814,23 @@ class HLSmartExecutor:
                             del self._tasks[task_key]
 
                         # Limpiar estado
-                        if coin in self.positions:
-                            del self.positions[coin]
+                        del self.positions[coin]
                         await self._clear_redis(coin)
+
+                    elif cycle % reconcile_every == 0:
+                        # Reconciliación: comparar tamaño exchange vs local
+                        exchange_size = abs(float(pos.get("szi", 0)))
+                        local_size = abs(state.size)
+                        if abs(exchange_size - local_size) > local_size * 0.05:
+                            logger.warning(
+                                "[RECONCILE] %s size mismatch: exchange=%.6f vs local=%.6f",
+                                coin, exchange_size, local_size,
+                            )
+                            await self._notifier.notify(
+                                AlertLevel.WARNING, f"Size mismatch: {coin}",
+                                f"  Exchange={exchange_size:.6f} vs Local={local_size:.6f}",
+                                source="Hyperliquid",
+                            )
 
             except Exception as exc:
                 logger.warning("[MONITOR] Error: %s", exc)
@@ -671,7 +861,7 @@ class HLSmartExecutor:
 
             state = PositionState.from_redis(data)
             self.positions[coin] = state
-            logger.info("[RESUME] %s: posición %s recuperada (entry=$%,.2f, size=%.6f)",
+            logger.info("[RESUME] %s: posición %s recuperada (entry=$%.2f, size=%.6f)",
                          coin, state.action, state.entry_price, state.size)
 
             # Reanudar timer de TP si aplica
@@ -710,6 +900,8 @@ class HLSmartExecutor:
   Channel: {config.HL_SIGNAL_CHANNEL}
   Position: {config.HL_POSITION_FRAC*100:.0f}% of balance
   Limit offset: {config.HL_LIMIT_OFFSET_BPS} bps | wait: {config.HL_LIMIT_WAIT_SEC}s
+  Reconcile: every {config.RECONCILE_INTERVAL_SEC}s
+  Journal: {config.TRADE_DB}
   Active positions: {len(self.positions)}
 ================================================================
 """)

@@ -13,7 +13,7 @@ services:
       --appendonly yes
       --save 60 1000
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     environment:
@@ -23,6 +23,67 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Base service for other application components
+  modulartrades-base:
+    build: .
+    working_dir: /home/appuser/app
+    volumes:
+      - .:/home/appuser/app
+      - /etc/localtime:/etc/localtime:ro # Sync time with host
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      # Use internal Docker network settings
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - SYMBOL=${SYMBOL}
+      - TIMEFRAME=${TIMEFRAME}
+      - EXCHANGE_ID=${EXCHANGE_ID}
+      - EXCHANGE_API_KEY=${EXCHANGE_API_KEY}
+      - EXCHANGE_SECRET=${EXCHANGE_SECRET}
+      - HL_PRIVATE_KEY=${HL_PRIVATE_KEY}
+      - LIGHTER_API_KEY=${LIGHTER_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - PYTHONUNBUFFERED=1
+
+  fetcher:
+    extends:
+      service: modulartrades-base
+    container_name: modulartrades-fetcher
+    command: python -m src.continuous_fetcher
+
+  strategy:
+    extends:
+      service: modulartrades-base
+    container_name: modulartrades-strategy
+    command: python my_strategy.py live
+
+  executor-hl:
+    extends:
+      service: modulartrades-base
+    container_name: modulartrades-executor-hl
+    command: python -m executor.hl_smart_executor --dry-run
+
+  executor-lighter:
+    extends:
+      service: modulartrades-base
+    container_name: modulartrades-executor-lighter
+    command: python -m executor.lighter_executor --dry-run
+
+  dashboard:
+    extends:
+      service: modulartrades-base
+    container_name: modulartrades-dashboard
+    command: streamlit run dashboard/app.py --server.port 8501 --server.headless true
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501" # Expose dashboard port
+    # Dashboard should ideally only be accessible via a reverse proxy in production
+    # or secured with authentication.
 
 volumes:
   redis_data:

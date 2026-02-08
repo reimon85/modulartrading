@@ -31,6 +31,7 @@ from pathlib import Path
 # ── Project imports ─────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src import config  # noqa: E402
+from src.notifier import AlertLevel, TelegramNotifier  # noqa: E402
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
@@ -210,12 +211,14 @@ class Orchestrator:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.pm = ProcessManager()
+        self._notifier = TelegramNotifier()
         self._running = True
 
     async def run(self) -> int:
         """Punto de entrada principal. Devuelve exit code."""
 
         self._print_banner()
+        await self._notifier.connect()
 
         # 1. Redis
         if not await ensure_redis():
@@ -239,11 +242,26 @@ class Orchestrator:
             self._launch_executor()
             await asyncio.sleep(1)
 
-        # 5. Monitor loop
+        # 5. Notify system started
+        components = []
+        if self.args.enable_strategy:
+            components.append("Strategy")
+        if self.args.enable_executor:
+            components.append(f"Executor({self.args.executor_target.upper()})")
+        await self._notifier.notify(
+            AlertLevel.INFO, "System started",
+            f"  Components: {', '.join(components) or 'Fetcher only'}",
+            source="Launcher",
+        )
+
+        # 6. Monitor loop
         if self.args.enable_strategy or self.args.enable_executor:
-            return await self._monitor_loop()
+            rc = await self._monitor_loop()
+            await self._notifier.disconnect()
+            return rc
 
         logger.info("Solo se lanzo el Data Fetcher (one-shot) — fin.")
+        await self._notifier.disconnect()
         return 0
 
     # ── Launchers ──────────────────────────────────────────────
@@ -266,10 +284,34 @@ class Orchestrator:
         return self.pm.launch("strategy", cmd)
 
     def _launch_executor(self) -> bool:
-        cmd = [PYTHON, "-m", "executor.hl_smart_executor"]
+        """Lanza el(los) executor(es) segun flags."""
+        launched = False
+
+        if self.args.executor_target in ("hl", "both"):
+            cmd = [PYTHON, "-m", "executor.hl_smart_executor"]
+            if self.args.dry_run:
+                cmd.append("--dry-run")
+            launched = self.pm.launch("executor_hl", cmd) or launched
+
+        if self.args.executor_target in ("lighter", "both"):
+            cmd = [PYTHON, "-m", "executor.lighter_executor"]
+            if self.args.dry_run:
+                cmd.append("--dry-run")
+            launched = self.pm.launch("executor_lighter", cmd) or launched
+
+        return launched
+
+    def _relaunch_executor(self, name: str) -> bool:
+        """Relanza un executor especifico por nombre."""
+        if name == "executor_hl":
+            cmd = [PYTHON, "-m", "executor.hl_smart_executor"]
+        elif name == "executor_lighter":
+            cmd = [PYTHON, "-m", "executor.lighter_executor"]
+        else:
+            return False
         if self.args.dry_run:
             cmd.append("--dry-run")
-        return self.pm.launch("executor", cmd)
+        return self.pm.launch(name, cmd)
 
     # ── Monitor ────────────────────────────────────────────────
 
@@ -297,18 +339,29 @@ class Orchestrator:
                             "[%s] Excedio max reinicios (%d) — no se reinicia mas",
                             name, max_restarts,
                         )
+                        await self._notifier.notify(
+                            AlertLevel.CRITICAL,
+                            f"Process {name} exceeded max restarts ({max_restarts})",
+                            source="Launcher",
+                        )
                         continue
 
                     rc = self.pm._procs[name].returncode
                     logger.warning("[%s] Caido (exit=%s) — reiniciando (%d/%d) ...",
                                    name, rc, count + 1, max_restarts)
+                    await self._notifier.notify(
+                        AlertLevel.WARNING,
+                        f"Process {name} crashed (exit={rc})",
+                        f"  Restarting ({count + 1}/{max_restarts})",
+                        source="Launcher",
+                    )
 
                     restart_counts[name] = count + 1
 
                     if name == "strategy":
                         self._launch_strategy()
-                    elif name == "executor":
-                        self._launch_executor()
+                    elif name.startswith("executor"):
+                        self._relaunch_executor(name)
 
                     await asyncio.sleep(2)
 
@@ -330,6 +383,10 @@ class Orchestrator:
                     return True
                 else:
                     logger.error("[%s] Fallo con exit code %d", name, rc)
+                    await self._notifier.notify(
+                        AlertLevel.CRITICAL, f"Process {name} failed (exit={rc})",
+                        source="Launcher",
+                    )
                     return False
             await asyncio.sleep(1)
 
@@ -345,7 +402,8 @@ class Orchestrator:
             components.append("Strategy (live)")
         if self.args.enable_executor:
             mode = "DRY RUN" if self.args.dry_run else "LIVE"
-            components.append(f"Executor ({mode})")
+            target = self.args.executor_target.upper()
+            components.append(f"Executor [{target}] ({mode})")
 
         print(f"""
 ================================================================
@@ -421,8 +479,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ejemplos:
-  python launcher.py                       Todo: fetcher + strategy + executor (dry-run)
+  python launcher.py                       Todo: fetcher + strategy + HL executor
   python launcher.py --dry-run             Executor en modo simulado
+  python launcher.py --lighter             Usar Lighter.xyz en vez de Hyperliquid
+  python launcher.py --both-executors      Ambos executors en paralelo
   python launcher.py --no-executor         Solo datos + estrategia
   python launcher.py --no-strategy         Solo datos + executor
   python launcher.py --fetcher-only        Solo descarga de datos
@@ -457,6 +517,14 @@ ejemplos:
         "--strategy-poll", type=int, default=10,
         help="Intervalo de polling de la estrategia en segundos (default: 10)",
     )
+    parser.add_argument(
+        "--lighter", action="store_true",
+        help="Usar Lighter.xyz executor en vez de Hyperliquid",
+    )
+    parser.add_argument(
+        "--both-executors", action="store_true",
+        help="Lanzar ambos executors (Hyperliquid + Lighter) en paralelo",
+    )
 
     args = parser.parse_args()
 
@@ -473,10 +541,25 @@ ejemplos:
         args.enable_strategy = not args.no_strategy
         args.enable_executor = not args.no_executor
 
-    # Auto dry-run if no private key
-    if args.enable_executor and not config.HL_PRIVATE_KEY:
-        args.dry_run = True
-        logger.info("HL_PRIVATE_KEY vacio — forzando --dry-run")
+    # Resolve executor target
+    if args.both_executors:
+        args.executor_target = "both"
+    elif args.lighter:
+        args.executor_target = "lighter"
+    else:
+        args.executor_target = "hl"
+
+    # Auto dry-run if no private keys for the selected executor(s)
+    if args.enable_executor:
+        if args.executor_target == "hl" and not config.HL_PRIVATE_KEY:
+            args.dry_run = True
+            logger.info("HL_PRIVATE_KEY vacio — forzando --dry-run")
+        elif args.executor_target == "lighter" and not config.LIGHTER_API_KEY:
+            args.dry_run = True
+            logger.info("LIGHTER_API_KEY vacio — forzando --dry-run")
+        elif args.executor_target == "both" and not config.HL_PRIVATE_KEY and not config.LIGHTER_API_KEY:
+            args.dry_run = True
+            logger.info("Sin API keys — forzando --dry-run")
 
     orchestrator = Orchestrator(args)
 

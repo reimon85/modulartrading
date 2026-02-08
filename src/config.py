@@ -26,7 +26,7 @@ EXCHANGE_SECRET: str = os.getenv("EXCHANGE_SECRET", "")
 # Market
 # ---------------------------------------------------------------------------
 SYMBOL: str = os.getenv("SYMBOL", "BTC/USDT")
-TIMEFRAME: str = os.getenv("TIMEFRAME", "1m")
+TIMEFRAME: str = os.getenv("TIMEFRAME", "2h")
 
 # Map timeframe strings to milliseconds for gap detection
 TIMEFRAME_MS: dict[str, int] = {
@@ -36,6 +36,7 @@ TIMEFRAME_MS: dict[str, int] = {
     "15m": 900_000,
     "30m": 1_800_000,
     "1h": 3_600_000,
+    "2h": 7_200_000,
     "4h": 14_400_000,
     "1d": 86_400_000,
 }
@@ -45,7 +46,7 @@ TIMEFRAME_MS: dict[str, int] = {
 # ---------------------------------------------------------------------------
 FETCH_LIMIT: int = int(os.getenv("FETCH_LIMIT", "1000"))
 MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
-RATE_LIMIT_MS: int = int(os.getenv("RATE_LIMIT_MS", "100"))
+RATE_LIMIT_MS: int = int(os.getenv("RATE_LIMIT_MS", "1000"))
 
 # ---------------------------------------------------------------------------
 # Redis
@@ -71,11 +72,39 @@ HL_SIGNAL_CHANNEL: str = os.getenv("HL_SIGNAL_CHANNEL", "trading_signals")
 HL_STATE_POLL_SEC: int = int(os.getenv("HL_STATE_POLL_SEC", "10"))
 
 # ---------------------------------------------------------------------------
+# Strategy → Executor bridge
+# ---------------------------------------------------------------------------
+STRATEGY_TP_POINTS: float = float(os.getenv("STRATEGY_TP_POINTS", "2400"))
+STRATEGY_SL_POINTS: float = float(os.getenv("STRATEGY_SL_POINTS", "1200"))
+STRATEGY_MAX_ENTRIES: int = int(os.getenv("STRATEGY_MAX_ENTRIES", "4"))
+STRATEGY_ENTRY_SIZE_BTC: float = float(os.getenv("STRATEGY_ENTRY_SIZE_BTC", "1.0"))
+
+# ---------------------------------------------------------------------------
+# Lighter.xyz DEX
+# ---------------------------------------------------------------------------
+LIGHTER_API_KEY: str = os.getenv("LIGHTER_API_KEY", "")
+LIGHTER_WALLET_ADDRESS: str = os.getenv("LIGHTER_WALLET_ADDRESS", "")
+LIGHTER_MAINNET: bool = os.getenv("LIGHTER_MAINNET", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # Storage paths
 # ---------------------------------------------------------------------------
 DATA_DIR: Path = _PROJECT_ROOT / os.getenv("DATA_DIR", "data")
 SQLITE_DB: Path = _PROJECT_ROOT / os.getenv("SQLITE_DB", "data/ohlcv.db")
+TRADE_DB: Path = _PROJECT_ROOT / os.getenv("TRADE_DB", "data/trades.db")
 PARQUET_DIR: Path = _PROJECT_ROOT / os.getenv("PARQUET_DIR", "data")
+
+# ---------------------------------------------------------------------------
+# Reconciliation & Signal Routing
+# ---------------------------------------------------------------------------
+RECONCILE_INTERVAL_SEC: int = int(os.getenv("RECONCILE_INTERVAL_SEC", "60"))
+SIGNAL_TARGET_EXCHANGE: str = os.getenv("SIGNAL_TARGET_EXCHANGE", "ALL")
+
+# ---------------------------------------------------------------------------
+# Telegram Alerts
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)

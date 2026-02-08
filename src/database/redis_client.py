@@ -37,7 +37,7 @@ logger = logging.getLogger("data_fetcher.redis")
 TICKER_HASH_KEY = "ticker:btc_usdt:latest"
 OHLCV_ZSET_KEY = "ohlcv:btc_usdt:{timeframe}"
 PUBSUB_CHANNEL = "ticker:btc_usdt"
-MAX_CANDLES = 100
+MAX_CANDLES = 1000
 
 
 # ---------------------------------------------------------------------------

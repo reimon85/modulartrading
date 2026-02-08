@@ -27,6 +27,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from dotenv import load_dotenv
+from src.database.trade_journal import get_all_trades_df
 
 load_dotenv(_PROJECT_ROOT / ".env")
 
@@ -149,6 +150,12 @@ def safe_redis_call(func, *args, default=None, **kwargs):
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=5)  # Cache trade data for 5 seconds
+def load_trade_data() -> pd.DataFrame:
+    """Load all trade data from the SQLite journal."""
+    return get_all_trades_df()
+
+
 def get_tick(r) -> dict | None:
     """Read latest tick snapshot from Redis hash."""
     return safe_redis_call(r.hgetall, "ticker:btc_usdt:latest", default=None)
@@ -161,19 +168,6 @@ def get_candles(r, timeframe: str = "1m", limit: int = 100) -> list[dict]:
     if not raw:
         return []
     return [json.loads(item) for item in raw]
-
-
-def get_active_positions(r) -> list[dict]:
-    """Read all active positions from Redis."""
-    pairs = safe_redis_call(r.smembers, "executor:active_pairs", default=set())
-    positions = []
-    for pair in pairs:
-        coin = pair.replace("/", "_").replace("USDT", "").replace("_", "").upper()
-        data = safe_redis_call(r.hgetall, f"executor:position:{coin}", default=None)
-        if data:
-            data["coin"] = coin
-            positions.append(data)
-    return positions
 
 
 def check_health(r) -> dict[str, str]:
@@ -219,17 +213,27 @@ def check_health(r) -> dict[str, str]:
     return health
 
 
-def format_countdown(entry_ts: float, tp_target_ts: float) -> tuple[str, float]:
+def format_countdown(open_ts_ms: float, tp_type: str, tp_value: float) -> tuple[str, float]:
     """Format TP countdown and return (text, progress 0-1)."""
+    if tp_type != "time" or not open_ts_ms or not tp_value:
+        return "N/A", 0.0
+
+    try:
+        # Assuming tp_value is in minutes for "time" type
+        entry_ts = float(open_ts_ms) / 1000
+        tp_target_ts = entry_ts + float(tp_value) * 60
+    except (ValueError, TypeError):
+        return "N/A", 0.0
+
     now = time.time()
-    total = tp_target_ts - entry_ts
+    total_duration = tp_target_ts - entry_ts
     elapsed = now - entry_ts
     remaining = tp_target_ts - now
 
-    if total <= 0:
+    if total_duration <= 0:
         return "N/A", 0.0
 
-    progress = max(0.0, min(1.0, elapsed / total))
+    progress = max(0.0, min(1.0, elapsed / total_duration))
 
     if remaining <= 0:
         return "EXPIRED", 1.0
@@ -312,23 +316,47 @@ with col_health:
     )
     st.markdown(f"**System Health** &nbsp;&nbsp; {leds}", unsafe_allow_html=True)
 
+st.markdown("---")
+
 # ---------------------------------------------------------------------------
-# 3. Metrics row
+# 3. Load and process trade data
+# ---------------------------------------------------------------------------
+trades_df = load_trade_data()
+open_trades = trades_df[trades_df["status"] == "OPEN"]
+closed_trades = trades_df[trades_df["status"] == "CLOSED"]
+
+# Calculate cumulative PnL
+total_pnl = closed_trades["pnl"].sum() if not closed_trades.empty else 0.0
+if not closed_trades.empty:
+    closed_trades = closed_trades.sort_values("close_ts")
+    closed_trades["cumulative_pnl"] = closed_trades["pnl"].cumsum()
+
+# ---------------------------------------------------------------------------
+# 4. Metrics row
 # ---------------------------------------------------------------------------
 col1, col2, col3, col4, col5 = st.columns(5)
 
+# Total PnL
+with col1:
+    delta_color = "normal" if total_pnl == 0 else ("inverse" if total_pnl < 0 else "off")
+    st.metric("Total PnL ($)", f"{total_pnl:+.2f}", delta_color=delta_color)
+
+# Open Positions
+with col2:
+    st.metric("Open Positions", len(open_trades))
+
 if tick:
     # 24h Change
-    with col1:
+    with col3:
         change = tick.get("change_24h")
         if change:
             val = float(change)
-            st.metric("24h Change", f"{val:+.2f}%")
+            st.metric("24h Change", f"{val:+.2f}%", delta_color="off")
         else:
             st.metric("24h Change", "N/A")
 
     # Volume
-    with col2:
+    with col4:
         vol = tick.get("volume_24h")
         if vol:
             v = float(vol)
@@ -342,94 +370,71 @@ if tick:
             st.metric("24h Volume", "N/A")
 
     # Spread
-    with col3:
+    with col5:
         spread = tick.get("spread_bps")
         if spread:
             st.metric("Spread", f"{float(spread):.2f} bps")
         else:
             st.metric("Spread", "N/A")
-
-    # Funding Rate
-    with col4:
-        funding = tick.get("funding_rate")
-        if funding:
-            st.metric("Funding Rate", f"{float(funding) * 100:.4f}%")
-        else:
-            st.metric("Funding Rate", "N/A")
-
-    # Open Positions
-    with col5:
-        positions = get_active_positions(r)
-        st.metric("Open Positions", len(positions))
 else:
-    for c in [col1, col2, col3, col4, col5]:
-        with c:
-            st.metric(c._provided_label if hasattr(c, '_provided_label') else "-", "N/A")
-    positions = []
+    for c in [col3, col4, col5]:
+        c.metric("-", "N/A")
+
 
 # ---------------------------------------------------------------------------
-# 4. Open Positions
+# 5. Open Positions
 # ---------------------------------------------------------------------------
-if not tick:
-    positions = get_active_positions(r)
-
-if positions:
+if not open_trades.empty:
     st.markdown("### Open Positions")
-    for pos in positions:
-        coin = pos.get("coin", "?")
-        side = pos.get("side", "?")
-        entry_price = pos.get("entry_price", "0")
-        size = pos.get("size", "0")
-        sl = pos.get("sl_price", "N/A")
-        tp_type = pos.get("tp_type", "N/A")
-        tp_value = pos.get("tp_value", "N/A")
-
-        side_color = "#00ff88" if side == "BUY" else "#ff4444"
+    for _, pos in open_trades.iterrows():
+        side_color = "#00ff88" if pos["action"] == "BUY" else "#ff4444"
 
         # Unrealized PnL
         pnl_text = "N/A"
-        if tick and tick.get("price") and entry_price != "0":
+        if tick and tick.get("price"):
             try:
-                current = float(tick["price"])
-                entry = float(entry_price)
-                if side == "BUY":
-                    pnl_pct = ((current - entry) / entry) * 100
-                else:
-                    pnl_pct = ((entry - current) / entry) * 100
-                pnl_color = "#00ff88" if pnl_pct >= 0 else "#ff4444"
-                pnl_text = f'<span style="color:{pnl_color}">{pnl_pct:+.2f}%</span>'
+                current_price = float(tick["price"])
+                entry_price = float(pos["entry_price"])
+                size = float(pos["size"])
+                if pos["action"] == "BUY":
+                    pnl_abs = (current_price - entry_price) * size
+                    pnl_pct = (current_price / entry_price - 1) * 100
+                else:  # SELL
+                    pnl_abs = (entry_price - current_price) * size
+                    pnl_pct = (entry_price / current_price - 1) * 100
+
+                pnl_color = "#00ff88" if pnl_abs >= 0 else "#ff4444"
+                pnl_text = f'<span style="color:{pnl_color}">{pnl_pct:+.2f}% (${pnl_abs:+.2f})</span>'
             except (ValueError, ZeroDivisionError):
                 pass
 
         # TP Time countdown
-        countdown_html = ""
-        progress_val = None
-        entry_ts = pos.get("entry_ts")
-        tp_target_ts = pos.get("tp_target_ts")
-        if tp_type == "time" and entry_ts and tp_target_ts:
-            try:
-                text, progress_val = format_countdown(float(entry_ts), float(tp_target_ts))
-                countdown_html = f" | Countdown: <b>{text}</b>"
-            except (ValueError, TypeError):
-                pass
+        countdown_html, progress_val = format_countdown(
+            pos["open_ts"], pos["tp_type"], pos["tp_value"]
+        )
+        if progress_val > 0:
+            countdown_html = f" | Countdown: <b>{countdown_html}</b>"
+        else:
+            countdown_html = ""
+
 
         st.markdown(f"""
 <div class="pos-card">
-    <b>{coin}</b> &nbsp;
-    <span style="color:{side_color}; font-weight:700">{side}</span> &nbsp;
-    Entry: ${float(entry_price):,.2f} &nbsp;
-    Size: {size} &nbsp;
-    SL: {sl} &nbsp;
-    TP: {tp_type} ({tp_value}){countdown_html} &nbsp;
+    <b>#{pos["id"]} {pos["coin"]}</b> &nbsp;
+    <span style="color:{side_color}; font-weight:700">{pos["action"]}</span> &nbsp;
+    Entry: ${pos["entry_price"]:,.4f} &nbsp;
+    Size: {pos["size"]} &nbsp;
+    SL: {pos["sl_price"] or 'N/A'} &nbsp;
+    TP: {pos["tp_type"]} ({pos["tp_value"]}){countdown_html} &nbsp;
     PnL: {pnl_text}
 </div>
 """, unsafe_allow_html=True)
 
-        if progress_val is not None:
+        if progress_val > 0:
             st.progress(progress_val)
 
 # ---------------------------------------------------------------------------
-# 5. Candlestick Chart
+# 6. Candlestick Chart
 # ---------------------------------------------------------------------------
 st.markdown("### Price Chart")
 
@@ -442,7 +447,7 @@ else:
     df_chart = load_parquet_fallback()
 
 if df_chart is not None and not df_chart.empty:
-    # Ensure numeric types
+    # Charting logic remains the same...
     for col in ["open", "high", "low", "close", "volume"]:
         if col in df_chart.columns:
             df_chart[col] = pd.to_numeric(df_chart[col], errors="coerce")
@@ -460,105 +465,64 @@ if df_chart is not None and not df_chart.empty:
         vertical_spacing=0.03,
         row_heights=[0.75, 0.25],
     )
-
-    # Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=df_chart["dt"],
-            open=df_chart["open"],
-            high=df_chart["high"],
-            low=df_chart["low"],
-            close=df_chart["close"],
-            name="BTC/USDT",
-            increasing_line_color="#00d4aa",
-            decreasing_line_color="#e94560",
-        ),
-        row=1, col=1,
-    )
-
-    # Volume bars
+    fig.add_trace(go.Candlestick(x=df_chart["dt"], open=df_chart["open"], high=df_chart["high"], low=df_chart["low"], close=df_chart["close"], name="BTC/USDT", increasing_line_color="#00d4aa", decreasing_line_color="#e94560"), row=1, col=1)
     if "volume" in df_chart.columns:
-        colors = [
-            "#00d4aa" if c >= o else "#e94560"
-            for c, o in zip(df_chart["close"], df_chart["open"])
-        ]
-        fig.add_trace(
-            go.Bar(
-                x=df_chart["dt"],
-                y=df_chart["volume"],
-                name="Volume",
-                marker_color=colors,
-                opacity=0.5,
-            ),
-            row=2, col=1,
-        )
+        colors = ["#00d4aa" if c >= o else "#e94560" for c, o in zip(df_chart["close"], df_chart["open"])]
+        fig.add_trace(go.Bar(x=df_chart["dt"], y=df_chart["volume"], name="Volume", marker_color=colors, opacity=0.5), row=2, col=1)
 
-    # Signal arrows from signals_log.parquet
-    signals_df = load_signals_log()
-    if signals_df is not None and not signals_df.empty:
-        signals_df["dt"] = pd.to_datetime(signals_df["timestamp"], unit="ms", utc=True)
-
-        # Filter to chart time range
-        if "dt" in df_chart.columns:
-            chart_start = df_chart["dt"].min()
-            signals_df = signals_df[signals_df["dt"] >= chart_start]
-
-        buys = signals_df[signals_df["signal"] == "BUY"]
-        sells = signals_df[signals_df["signal"] == "SELL"]
-
-        if not buys.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=buys["dt"],
-                    y=buys["price"],
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-up",
-                        size=14,
-                        color="#00ff88",
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="BUY",
-                ),
-                row=1, col=1,
-            )
-
-        if not sells.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=sells["dt"],
-                    y=sells["price"],
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-down",
-                        size=14,
-                        color="#ff4444",
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="SELL",
-                ),
-                row=1, col=1,
-            )
-
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
-        height=500,
-        margin=dict(l=50, r=20, t=30, b=30),
-        xaxis_rangeslider_visible=False,
-        showlegend=False,
-        font=dict(family="monospace", color="#ffffff"),
-    )
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", height=500, margin=dict(l=50, r=20, t=30, b=30), xaxis_rangeslider_visible=False, showlegend=False, font=dict(family="monospace", color="#ffffff"))
     fig.update_xaxes(gridcolor="#1a1a2e")
     fig.update_yaxes(gridcolor="#1a1a2e")
-
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("No candle data available. Start the Data Fetcher to populate Redis.")
 
 # ---------------------------------------------------------------------------
-# 6. Emergency Close
+# 7. PnL and Trade History
+# ---------------------------------------------------------------------------
+st.markdown("---")
+col_pnl, col_history = st.columns([2, 3])
+
+with col_pnl:
+    st.markdown("### Cumulative PnL")
+    if not closed_trades.empty:
+        pnl_fig = go.Figure()
+        pnl_fig.add_trace(go.Scatter(
+            x=pd.to_datetime(closed_trades["close_ts"], unit="ms"),
+            y=closed_trades["cumulative_pnl"],
+            mode="lines+markers",
+            name="Cumulative PnL",
+            line=dict(color="#00d4aa", width=2),
+            marker=dict(size=5),
+        ))
+        pnl_fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0e1117",
+            plot_bgcolor="#1a1a2e",
+            height=300,
+            margin=dict(l=50, r=20, t=30, b=30),
+            font=dict(family="monospace"),
+        )
+        st.plotly_chart(pnl_fig, use_container_width=True)
+    else:
+        st.info("No closed trades to show PnL chart.")
+
+with col_history:
+    st.markdown("### Trade History")
+    if not closed_trades.empty:
+        # Format for display
+        history_df = closed_trades[[
+            "id", "coin", "action", "entry_price", "exit_price", "size", "pnl", "close_reason"
+        ]].copy()
+        history_df["pnl"] = history_df["pnl"].map('{:,.2f}'.format)
+        history_df = history_df.sort_values("id", ascending=False).set_index("id")
+        st.dataframe(history_df, use_container_width=True)
+    else:
+        st.info("No trade history yet.")
+
+
+# ---------------------------------------------------------------------------
+# 8. Emergency Close
 # ---------------------------------------------------------------------------
 st.markdown("---")
 st.markdown("### Emergency Close")
@@ -579,8 +543,7 @@ with col_btn:
         with col_yes:
             if st.button("YES, CLOSE ALL", type="primary"):
                 signal = json.dumps({
-                    "action": "CLOSE",
-                    "pair": "BTC/USDT",
+                    "action": "CLOSE_ALL",
                     "source": "dashboard",
                     "timestamp": int(time.time() * 1000),
                 })
@@ -599,7 +562,7 @@ with col_btn:
                 st.rerun()
 
 # ---------------------------------------------------------------------------
-# 7. System Info (expandable)
+# 9. System Info (expandable)
 # ---------------------------------------------------------------------------
 with st.expander("System Info"):
     info_cols = st.columns(3)
@@ -615,14 +578,9 @@ with st.expander("System Info"):
 
     with info_cols[1]:
         st.markdown("**Data**")
+        st.text(f"Journal Trades: {len(trades_df)}")
         candle_count = safe_redis_call(r.zcard, "ohlcv:btc_usdt:1m", default=0)
         st.text(f"Candles in Redis: {candle_count or 0}")
-        parquet_path = _PROJECT_ROOT / "data" / "BTC_USDT_1m.parquet"
-        if parquet_path.exists():
-            size_mb = parquet_path.stat().st_size / (1024 * 1024)
-            st.text(f"Parquet: {size_mb:.1f} MB")
-        else:
-            st.text("Parquet: not found")
 
     with info_cols[2]:
         st.markdown("**Config**")
