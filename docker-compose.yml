@@ -1,90 +1,47 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
-    container_name: modulartrades-redis
+    container_name: system3-redis
     restart: unless-stopped
-    command: >
-      redis-server
-      --requirepass ${REDIS_PASSWORD:-S3cur3_R3d1s_2024!}
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --appendonly yes
-      --save 60 1000
+    command: redis-server --save 60 1 --loglevel warning
     ports:
-      - "${REDIS_PORT:-6380}:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
-    environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-S3cur3_R3d1s_2024!}
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-S3cur3_R3d1s_2024!}", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  # Base service for other application components
-  modulartrades-base:
+  # Base para evitar repetir configuración
+  base:
     build: .
-    working_dir: /home/appuser/app
     volumes:
       - .:/home/appuser/app
-      - /etc/localtime:/etc/localtime:ro # Sync time with host
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
     restart: unless-stopped
+    env_file: .env
     environment:
-      # Use internal Docker network settings
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - SYMBOL=${SYMBOL}
-      - TIMEFRAME=${TIMEFRAME}
-      - EXCHANGE_ID=${EXCHANGE_ID}
-      - EXCHANGE_API_KEY=${EXCHANGE_API_KEY}
-      - EXCHANGE_SECRET=${EXCHANGE_SECRET}
-      - HL_PRIVATE_KEY=${HL_PRIVATE_KEY}
-      - LIGHTER_API_KEY=${LIGHTER_API_KEY}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - PYTHONUNBUFFERED=1
 
-  fetcher:
-    extends:
-      service: modulartrades-base
-    container_name: modulartrades-fetcher
-    command: python -m src.continuous_fetcher
-
   strategy:
-    extends:
-      service: modulartrades-base
-    container_name: modulartrades-strategy
-    command: python my_strategy.py live
+    extends: base
+    container_name: system3-strategy
+    command: python dca_strategy.py --symbol BTC/USDT
 
-  executor-hl:
-    extends:
-      service: modulartrades-base
-    container_name: modulartrades-executor-hl
-    command: python -m executor.hl_smart_executor --dry-run
+  executor-extended:
+    extends: base
+    container_name: system3-executor-extended
+    command: python -m executor.extended_executor
 
   executor-lighter:
-    extends:
-      service: modulartrades-base
-    container_name: modulartrades-executor-lighter
-    command: python -m executor.lighter_executor --dry-run
+    extends: base
+    container_name: system3-executor-lighter
+    command: python -m executor.lighter_executor
 
-  dashboard:
-    extends:
-      service: modulartrades-base
-    container_name: modulartrades-dashboard
-    command: streamlit run dashboard/app.py --server.port 8501 --server.headless true
-    ports:
-      - "${DASHBOARD_PORT:-8501}:8501" # Expose dashboard port
-    # Dashboard should ideally only be accessible via a reverse proxy in production
-    # or secured with authentication.
+  fetcher:
+    extends: base
+    container_name: system3-fetcher
+    command: python -m src.continuous_fetcher --symbol BTC/USDT --timeframes 1h,1d
 
 volumes:
   redis_data:
-    driver: local
