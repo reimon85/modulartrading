@@ -174,6 +174,10 @@ class ExtendedSmartExecutor:
                     mid = float(p.mark_price)
                     is_buy = state.action in ("BUY", "LONG")
                     
+                    # Restauramos cálculo de PnL para el log
+                    pnl = (mid/state.entry_price - 1)*100 if is_buy else (state.entry_price/mid - 1)*100
+                    logger.info(f"VIGILANCIA | {coin} {state.action} | Px: {mid:.1f} | Entry: {state.entry_price:.1f} | PnL: {pnl:.2f}% | TP: {state.tp_value}")
+                    
                     if state.sl_price > 0:
                         if (is_buy and mid <= state.sl_price) or (not is_buy and mid >= state.sl_price):
                             logger.error(f"🔥 STOP LOSS TRIGGERED para {coin} @ {mid}")

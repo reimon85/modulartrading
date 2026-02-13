@@ -225,13 +225,21 @@ class LighterSmartExecutor:
 
     async def _health_monitor(self) -> None:
         while self._running:
-            await asyncio.sleep(300) 
+            await asyncio.sleep(60) # Vigilancia cada minuto
             async with self._pos_lock:
-                signer = await self.client.get_signer()
-                try:
-                    await self._sync_and_protect(signer, "BTC")
-                except Exception as e: logger.error(f"Error monitor salud Lighter: {e}")
-                finally: await signer.close()
+                for coin, state in list(self.positions.items()):
+                    try:
+                        pos_real = await self.client.get_position(coin)
+                        if pos_real:
+                            mid = float(pos_real["entryPx"]) # O ticker
+                            is_buy = state.action == "BUY"
+                            pnl = (mid/state.entry_price - 1)*100 if is_buy else (state.entry_price/mid - 1)*100
+                            logger.info(f"VIGILANCIA LIGHTER | {coin} {state.action} | Px: {mid:.1f} | PnL: {pnl:.2f}% | Lotes: {abs(state.size)/0.01:.0f}")
+                        
+                        signer = await self.client.get_signer()
+                        await self._sync_and_protect(signer, coin)
+                        await signer.close()
+                    except Exception as e: logger.error(f"Error monitor salud Lighter: {e}")
 
     async def _resume_positions(self) -> None:
         active = await self._redis.smembers(self.ACTIVE_KEY)
