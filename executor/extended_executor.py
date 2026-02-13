@@ -251,10 +251,24 @@ class ExtendedSmartExecutor:
 
     async def _handle_trade_atomic(self, sig: dict):
         """Maneja las señales de trading (OPEN, DCA, CLOSE)."""
+        # Deduplicación de señales usando un ID único o hash del contenido
+        sig_id = sig.get("signal_id") or str(hash(json.dumps(sig, sort_keys=True)))
+        dedup_key = f"executor:extended:dedup:{sig_id}"
+        
+        if await self._redis.get(dedup_key):
+            logger.info(f"♻️ Señal duplicada omitida: {sig_id}")
+            return
+            
         async with self._pos_lock:
+            # Doble check dentro del lock
+            if await self._redis.get(dedup_key): return
+            
+            # Marcar como procesada (TTL de 10 minutos para evitar colisiones lejanas)
+            await self._redis.set(dedup_key, "1", ex=600)
+            
             coin = sig["pair"].split("/")[0]
             action = sig["action"].upper()
-            logger.info(f"⚡ SEÑAL RECIBIDA: {coin} {action}")
+            logger.info(f"⚡ SEÑAL RECIBIDA: {coin} {action} (ID: {sig_id})")
             
             if action == "CLOSE":
                 await self._cleanup_and_close(coin, "SIGNAL")
