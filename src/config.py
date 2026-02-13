@@ -10,10 +10,24 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Load .env from project root
+# Load .env from project root or Vault
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env", override=True)
+env_path = _PROJECT_ROOT / ".env"
+
+if env_path.exists():
+    load_dotenv(env_path, override=True)
+else:
+    # Intento cargar desde el Vault si no hay .env en disco
+    try:
+        from vault import load_secrets
+        secrets = load_secrets()
+        for k, v in secrets.items():
+            os.environ[k] = v
+        if secrets:
+            logging.info("🔓 Configuración cargada desde el Vault (en memoria)")
+    except ImportError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Exchange
@@ -80,12 +94,12 @@ STRATEGY_SL_POINTS: float = float(os.getenv("STRATEGY_SL_POINTS", "1200"))
 STRATEGY_MAX_ENTRIES: int = int(os.getenv("STRATEGY_MAX_ENTRIES", "4"))
 STRATEGY_ENTRY_SIZE_BTC: float = float(os.getenv("STRATEGY_ENTRY_SIZE_BTC", "1.0"))
 
-# ---------------------------------------------------------------------------
-# Lighter.xyz DEX
-# ---------------------------------------------------------------------------
+# --- CLAVES LIGHTER ---
 LIGHTER_API_KEY: str = os.getenv("LIGHTER_API_KEY", "")
 LIGHTER_WALLET_ADDRESS: str = os.getenv("LIGHTER_WALLET_ADDRESS", "")
 LIGHTER_MAINNET: bool = os.getenv("LIGHTER_MAINNET", "false").lower() == "true"
+LIGHTER_API_INDEX: int = int(os.getenv("LIGHTER_API_INDEX", "3"))
+LIGHTER_ACCOUNT_INDEX: int = int(os.getenv("LIGHTER_ACCOUNT_INDEX", "0"))
 
 # ---------------------------------------------------------------------------
 # HyENA DEX (Hyperliquid HIP-3)
