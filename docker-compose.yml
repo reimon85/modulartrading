@@ -3,45 +3,62 @@ services:
     image: redis:7-alpine
     container_name: system3-redis
     restart: unless-stopped
-    command: redis-server --save 60 1 --loglevel warning
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
 
-  # Base para evitar repetir configuración
-  base:
+  strategy:
     build: .
-    volumes:
-      - .:/home/appuser/app
-    depends_on:
-      - redis
+    container_name: system3-strategy
     restart: unless-stopped
     env_file: .env
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
-
-  strategy:
-    extends: base
-    container_name: system3-strategy
     command: python dca_strategy.py --symbol BTC/USDT
+    depends_on:
+      - redis
 
   executor-extended:
-    extends: base
+    build: .
     container_name: system3-executor-extended
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PYTHONUNBUFFERED=1
     command: python -m executor.extended_executor
+    depends_on:
+      - redis
 
   executor-lighter:
-    extends: base
+    build: .
     container_name: system3-executor-lighter
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PYTHONUNBUFFERED=1
     command: python -m executor.lighter_executor
+    depends_on:
+      - redis
 
   fetcher:
-    extends: base
+    build: .
     container_name: system3-fetcher
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PYTHONUNBUFFERED=1
     command: python -m src.continuous_fetcher --symbol BTC/USDT --timeframes 1h,1d
+    depends_on:
+      - redis
 
 volumes:
   redis_data:
