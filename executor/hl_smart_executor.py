@@ -33,9 +33,9 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import config  # noqa: E402
 from src.database.trade_journal import TradeJournal  # noqa: E402
 from src.notifier import AlertLevel, TelegramNotifier  # noqa: E402
+from executor.models import PositionState, validate_signal  # noqa: E402
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
@@ -215,62 +216,7 @@ class HLClient:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  2. MODELOS DE ESTADO
-# ═══════════════════════════════════════════════════════════════════
-
-@dataclass
-class PositionState:
-    """Estado de una posición activa, persistido en Redis."""
-    coin: str
-    action: str              # BUY / SELL
-    entry_price: float
-    size: float
-    sl_price: float
-    sl_oid: int = 0
-    tp_type: str = "PRICE"   # PRICE / TIME
-    tp_value: float = 0.0    # precio o minutos
-    tp_oid: int = 0
-    tp_target_ts: int = 0    # epoch ms (solo para TIME)
-    entry_ts: int = 0        # epoch ms
-    status: str = "OPEN"
-    entries: list = field(default_factory=list)   # [{"price": float, "size": float, "ts": int}]
-    max_entries: int = 4
-    entry_size: float = 1.0
-    trade_id: int = 0
-
-    def to_redis(self) -> dict[str, str]:
-        d = {k: str(v) for k, v in asdict(self).items() if k != "entries"}
-        d["entries"] = json.dumps(self.entries)
-        return d
-
-    @classmethod
-    def from_redis(cls, data: dict[str, str]) -> PositionState:
-        entries_raw = data.get("entries", "[]")
-        try:
-            entries = json.loads(entries_raw)
-        except (json.JSONDecodeError, TypeError):
-            entries = []
-        return cls(
-            coin=data["coin"], action=data["action"],
-            entry_price=float(data["entry_price"]),
-            size=float(data["size"]),
-            sl_price=float(data["sl_price"]),
-            sl_oid=int(data.get("sl_oid", 0) or 0),
-            tp_type=data.get("tp_type", "PRICE"),
-            tp_value=float(data.get("tp_value", 0) or 0),
-            tp_oid=int(data.get("tp_oid", 0) or 0),
-            tp_target_ts=int(data.get("tp_target_ts", 0) or 0),
-            entry_ts=int(data.get("entry_ts", 0) or 0),
-            status=data.get("status", "OPEN"),
-            entries=entries,
-            max_entries=int(data.get("max_entries", 4) or 4),
-            entry_size=float(data.get("entry_size", 1.0) or 1.0),
-            trade_id=int(data.get("trade_id", 0) or 0),
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  3. HELPERS
+#  2. HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_oid(result: dict) -> int | None:
@@ -332,6 +278,7 @@ class HLSmartExecutor:
         self._journal = TradeJournal()
         self._notifier = TelegramNotifier()
         self._running = True
+        self._pos_lock = asyncio.Lock()
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -375,38 +322,60 @@ class HLSmartExecutor:
     # ── Signal Listener ────────────────────────────────────────
 
     async def _listen_signals(self) -> None:
-        """Suscripción Pub/Sub al canal de señales."""
-        pubsub = self._redis.pubsub()
-        await pubsub.subscribe(config.HL_SIGNAL_CHANNEL)
-        logger.info("Escuchando canal: %s", config.HL_SIGNAL_CHANNEL)
-
-        async for msg in pubsub.listen():
-            if not self._running:
-                break
-            if msg["type"] != "message":
-                continue
+        """Suscripción Pub/Sub al canal de señales con reconexión automática."""
+        backoff = 1
+        while self._running:
             try:
-                signal = json.loads(msg["data"])
-                # Filtro: ignorar señales destinadas a otro exchange
-                exchange = signal.get("exchange", "").upper()
-                if exchange and exchange not in ("", "HL", "HYPERLIQUID", "ALL"):
-                    logger.debug("Signal skip (exchange=%s, esperado HL)", exchange)
-                    continue
-                logger.info("SIGNAL recibida: %s", json.dumps(signal, indent=None))
-                await self._dispatch(signal)
-            except json.JSONDecodeError:
-                logger.warning("Mensaje inválido (no JSON): %s", msg["data"])
+                pubsub = self._redis.pubsub()
+                await pubsub.subscribe(config.HL_SIGNAL_CHANNEL)
+                logger.info("Escuchando canal: %s", config.HL_SIGNAL_CHANNEL)
+                backoff = 1  # reset on successful connect
+
+                async for msg in pubsub.listen():
+                    if not self._running:
+                        return
+                    if msg["type"] != "message":
+                        continue
+                    try:
+                        signal = json.loads(msg["data"])
+                        exchange = signal.get("exchange", "").upper()
+                        if exchange and exchange not in ("", "HL", "HYPERLIQUID", "ALL"):
+                            logger.debug("Signal skip (exchange=%s, esperado HL)", exchange)
+                            continue
+                        logger.info("SIGNAL recibida: %s", json.dumps(signal, indent=None))
+                        await self._dispatch(signal)
+                    except json.JSONDecodeError:
+                        logger.warning("Mensaje inválido (no JSON): %s", msg["data"])
+                    except Exception as exc:
+                        logger.error("Error procesando señal: %s", exc, exc_info=True)
+
+            except asyncio.CancelledError:
+                return
             except Exception as exc:
-                logger.error("Error procesando señal: %s", exc, exc_info=True)
+                logger.warning("[PUBSUB] Conexión perdida: %s — reconectando en %ds", exc, backoff)
+                await self._notifier.notify(
+                    AlertLevel.WARNING, "Redis PubSub desconectado",
+                    f"  Error: {exc}\n  Reconectando en {backoff}s", source="Hyperliquid",
+                )
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    pass
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def _dispatch(self, signal: dict) -> None:
-        action = signal.get("action", "").upper()
-        if action in ("BUY", "SELL"):
-            await self._open_position(signal)
-        elif action == "CLOSE":
-            await self._close_position(signal)
-        else:
-            logger.warning("Acción desconocida: %s", action)
+        err = validate_signal(signal)
+        if err:
+            logger.warning("Señal rechazada: %s | payload=%s", err, signal)
+            return
+
+        async with self._pos_lock:
+            action = signal.get("action", "").upper()
+            if action in ("BUY", "SELL"):
+                await self._open_position(signal)
+            elif action == "CLOSE":
+                await self._close_position(signal)
 
     # ── OPEN POSITION ──────────────────────────────────────────
 
@@ -433,9 +402,17 @@ class HLSmartExecutor:
             await self._handle_reentry(signal)
             return
 
-        # 2. Validar saldo
+        # 2. Validar saldo y SL coherente
         balance = await self.client.get_balance()
         mid_price = await self.client.get_mid_price(coin)
+
+        if is_buy and sl_price >= mid_price:
+            logger.error("SL inválido para BUY: sl=$%.2f >= mid=$%.2f — abortando", sl_price, mid_price)
+            return
+        if not is_buy and sl_price <= mid_price:
+            logger.error("SL inválido para SELL: sl=$%.2f <= mid=$%.2f — abortando", sl_price, mid_price)
+            return
+
         required_usd = entry_size * mid_price
         if required_usd > balance:
             logger.error("Saldo insuficiente: necesario=$%.2f, disponible=$%.2f", required_usd, balance)
@@ -470,7 +447,11 @@ class HLSmartExecutor:
             return
 
         entry_price = entry["price"]
-        logger.info("  Entrada ejecutada: %s @ $%.2f (%s)", side, entry_price, entry["type"])
+        filled_size = round(entry.get("size", size), self.client._sz(coin))
+        if filled_size != size:
+            logger.warning("  Partial fill: pedido=%.6f, llenado=%.6f", size, filled_size)
+        size = filled_size
+        logger.info("  Entrada ejecutada: %s x%.6f @ $%.2f (%s)", side, size, entry_price, entry["type"])
 
         # 6. Stop Loss (trigger nativo)
         sl_result = await self.client.trigger_order(coin, not is_buy, size, sl_price, "sl")
@@ -703,9 +684,9 @@ class HLSmartExecutor:
                     # Order ya no está pendiente — verificar posición
                     pos = await self.client.get_position(coin)
                     if pos and abs(float(pos.get("szi", 0))) > 0:
-                        return {"price": float(pos["entryPx"]), "type": "LIMIT"}
+                        return {"price": float(pos["entryPx"]), "size": abs(float(pos["szi"])), "type": "LIMIT"}
                     # Filled pero posición no encontrada? (raro)
-                    return {"price": float(limit_px), "type": "LIMIT"}
+                    return {"price": float(limit_px), "size": size, "type": "LIMIT"}
 
             # Timeout — cancelar limit y usar market
             logger.warning("  Limit no llenó en %ds — fallback a MARKET", config.HL_LIMIT_WAIT_SEC)
@@ -720,8 +701,8 @@ class HLSmartExecutor:
             await asyncio.sleep(0.5)
             pos = await self.client.get_position(coin)
             if pos:
-                return {"price": float(pos.get("entryPx", mid_price)), "type": "MARKET"}
-            return {"price": mid_price, "type": "MARKET"}
+                return {"price": float(pos.get("entryPx", mid_price)), "size": abs(float(pos.get("szi", size))), "type": "MARKET"}
+            return {"price": mid_price, "size": size, "type": "MARKET"}
         except Exception as exc:
             logger.error("  MARKET order también falló: %s", exc)
             await self._notifier.notify(
@@ -913,10 +894,15 @@ class HLSmartExecutor:
 
 async def _run(dry_run: bool) -> None:
     executor = HLSmartExecutor(dry_run=dry_run)
-    try:
-        await executor.start()
-    except KeyboardInterrupt:
-        logger.info("Detenido por el usuario")
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_handle_stop(executor, s)))
+    await executor.start()
+
+
+async def _handle_stop(executor: HLSmartExecutor, sig: signal.Signals) -> None:
+    logger.info("Recibida señal %s — iniciando shutdown graceful", sig.name)
+    await executor._shutdown()
 
 
 def main() -> None:

@@ -224,91 +224,117 @@ class Orchestrator:
         if not await ensure_redis():
             return 1
 
-        # 2. Data Fetcher
-        if not self._launch_fetcher():
+        # 2. Initial Data Sync (One-shot)
+        tfs = config.TIMEFRAME
+        if getattr(self.args, "dca", False):
+            if "15m" not in tfs: tfs = f"{tfs},15m"
+            if "1d" not in tfs: tfs = f"{tfs},1d"
+            
+        if not self._launch_initial_sync(tfs):
             return 1
 
-        # Esperar a que el fetcher complete su ciclo inicial
-        logger.info("Esperando al Data Fetcher (ciclo inicial) ...")
-        await self._wait_for_process("fetcher", timeout=120)
+        # Esperar a que el sync inicial complete
+        logger.info("Esperando al Sync Inicial (todos los timeframes) ...")
+        await self._wait_for_process("initial_sync", timeout=300)
 
-        # 3. Strategy Engine (si habilitada)
+        # 3. Continuous Fetcher (Service)
+        self._launch_continuous_fetcher(tfs)
+
+        # 4. Strategy Engine (si habilitada)
         if self.args.enable_strategy:
             self._launch_strategy()
-            await asyncio.sleep(2)  # Dar tiempo a conectar Redis
+            await asyncio.sleep(2)
 
-        # 4. Executor (si habilitado)
+        # 5. Executor (si habilitado)
         if self.args.enable_executor:
             self._launch_executor()
             await asyncio.sleep(1)
 
-        # 5. Notify system started
-        components = []
+        # 6. Notify system started
+        components = ["Fetcher(Continuous)"]
         if self.args.enable_strategy:
             components.append("Strategy")
         if self.args.enable_executor:
-            components.append(f"Executor({self.args.executor_target.upper()})")
+            components.append(f"Executor({getattr(self.args, 'executor_targets', [])})")
+            
         await self._notifier.notify(
             AlertLevel.INFO, "System started",
-            f"  Components: {', '.join(components) or 'Fetcher only'}",
+            f"  Components: {', '.join(components)}",
             source="Launcher",
         )
 
-        # 6. Monitor loop
-        if self.args.enable_strategy or self.args.enable_executor:
-            rc = await self._monitor_loop()
-            await self._notifier.disconnect()
-            return rc
-
-        logger.info("Solo se lanzo el Data Fetcher (one-shot) — fin.")
+        # 7. Monitor loop
+        rc = await self._monitor_loop()
         await self._notifier.disconnect()
-        return 0
+        return rc
 
     # ── Launchers ──────────────────────────────────────────────
 
-    def _launch_fetcher(self) -> bool:
+    def _launch_initial_sync(self, timeframes: str) -> bool:
         cmd = [
             PYTHON, "-m", "src.main",
             "--symbol", config.SYMBOL,
-            "--timeframe", config.TIMEFRAME,
+            "--timeframe", timeframes,
             "--days", str(self.args.fetcher_days),
         ]
-        return self.pm.launch("fetcher", cmd)
+        return self.pm.launch("initial_sync", cmd)
+
+    def _launch_continuous_fetcher(self, timeframes: str) -> bool:
+        cmd = [
+            PYTHON, "-m", "src.continuous_fetcher",
+            "--symbol", config.SYMBOL,
+            "--timeframes", timeframes,
+        ]
+        return self.pm.launch("fetcher_continuous", cmd)
 
     def _launch_strategy(self) -> bool:
-        cmd = [
-            PYTHON, "my_strategy.py", "live",
-            "--poll", str(self.args.strategy_poll),
-            "--timeframe", config.TIMEFRAME,
-        ]
-        return self.pm.launch("strategy", cmd)
+        if getattr(self.args, "dca", False):
+            cmd = [
+                PYTHON, "dca_strategy.py",
+                "--symbol", config.SYMBOL,
+                "--poll", str(self.args.strategy_poll),
+            ]
+            name = "strategy_dca"
+        else:
+            cmd = [
+                PYTHON, "my_strategy.py", "live",
+                "--poll", str(self.args.strategy_poll),
+                "--timeframe", config.TIMEFRAME,
+            ]
+            name = "strategy"
+        return self.pm.launch(name, cmd)
 
     def _launch_executor(self) -> bool:
         """Lanza el(los) executor(es) segun flags."""
         launched = False
 
-        if self.args.executor_target in ("hl", "both"):
-            cmd = [PYTHON, "-m", "executor.hl_smart_executor"]
+        targets = getattr(self.args, "executor_targets", ["hl"])
+        
+        for target in targets:
+            cmd = [PYTHON, "-m"]
+            if target == "hl": cmd.append("executor.hl_smart_executor")
+            elif target == "lighter": cmd.append("executor.lighter_executor")
+            elif target == "hyena": cmd.append("executor.hyena_executor")
+            elif target == "extended": cmd.append("executor.extended_executor")
+            
             if self.args.dry_run:
                 cmd.append("--dry-run")
-            launched = self.pm.launch("executor_hl", cmd) or launched
-
-        if self.args.executor_target in ("lighter", "both"):
-            cmd = [PYTHON, "-m", "executor.lighter_executor"]
-            if self.args.dry_run:
-                cmd.append("--dry-run")
-            launched = self.pm.launch("executor_lighter", cmd) or launched
+            
+            name = f"executor_{target}"
+            launched = self.pm.launch(name, cmd) or launched
 
         return launched
 
     def _relaunch_executor(self, name: str) -> bool:
         """Relanza un executor especifico por nombre."""
-        if name == "executor_hl":
-            cmd = [PYTHON, "-m", "executor.hl_smart_executor"]
-        elif name == "executor_lighter":
-            cmd = [PYTHON, "-m", "executor.lighter_executor"]
-        else:
-            return False
+        target = name.replace("executor_", "")
+        cmd = [PYTHON, "-m"]
+        if target == "hl": cmd.append("executor.hl_smart_executor")
+        elif target == "lighter": cmd.append("executor.lighter_executor")
+        elif target == "hyena": cmd.append("executor.hyena_executor")
+        elif target == "extended": cmd.append("executor.extended_executor")
+        else: return False
+        
         if self.args.dry_run:
             cmd.append("--dry-run")
         return self.pm.launch(name, cmd)
@@ -329,8 +355,8 @@ class Orchestrator:
                 break
 
             for name in list(self.pm._procs.keys()):
-                if name == "fetcher":
-                    continue  # fetcher es one-shot
+                if name == "initial_sync":
+                    continue  # sync inicial es one-shot
 
                 if not self.pm.is_alive(name):
                     count = restart_counts.get(name, 0)
@@ -358,7 +384,13 @@ class Orchestrator:
 
                     restart_counts[name] = count + 1
 
-                    if name == "strategy":
+                    if name == "fetcher_continuous":
+                        tfs = config.TIMEFRAME
+                        if getattr(self.args, "dca", False):
+                            if "15m" not in tfs: tfs = f"{tfs},15m"
+                            if "1d" not in tfs: tfs = f"{tfs},1d"
+                        self._launch_continuous_fetcher(tfs)
+                    elif name.startswith("strategy"):
                         self._launch_strategy()
                     elif name.startswith("executor"):
                         self._relaunch_executor(name)
@@ -396,14 +428,14 @@ class Orchestrator:
     # ── Banner ─────────────────────────────────────────────────
 
     def _print_banner(self) -> None:
-        components = []
-        components.append("Data Fetcher")
+        components = ["Fetcher (Multi-TF)"]
         if self.args.enable_strategy:
-            components.append("Strategy (live)")
+            name = "DCA" if getattr(self.args, "dca", False) else "Standard"
+            components.append(f"Strategy ({name})")
         if self.args.enable_executor:
             mode = "DRY RUN" if self.args.dry_run else "LIVE"
-            target = self.args.executor_target.upper()
-            components.append(f"Executor [{target}] ({mode})")
+            targets = getattr(self.args, "executor_targets", ["HL"])
+            components.append(f"Executors {targets} ({mode})")
 
         print(f"""
 ================================================================
@@ -506,12 +538,16 @@ ejemplos:
         help="No lanzar la estrategia",
     )
     parser.add_argument(
+        "--dca", action="store_true",
+        help="Usar la estrategia DCA Pullback (45m) en lugar de la estandar",
+    )
+    parser.add_argument(
         "--fetcher-only", action="store_true",
         help="Solo ejecutar el Data Fetcher (one-shot)",
     )
     parser.add_argument(
-        "--fetcher-days", type=int, default=7,
-        help="Dias de historico a descargar (default: 7)",
+        "--fetcher-days", type=int, default=80,
+        help="Dias de historico a descargar (default: 80)",
     )
     parser.add_argument(
         "--strategy-poll", type=int, default=10,
@@ -519,11 +555,23 @@ ejemplos:
     )
     parser.add_argument(
         "--lighter", action="store_true",
-        help="Usar Lighter.xyz executor en vez de Hyperliquid",
+        help="Usar Lighter.xyz executor",
+    )
+    parser.add_argument(
+        "--hyena", action="store_true",
+        help="Usar HyENA executor",
+    )
+    parser.add_argument(
+        "--extended", action="store_true",
+        help="Usar Extended (X10) executor",
     )
     parser.add_argument(
         "--both-executors", action="store_true",
-        help="Lanzar ambos executors (Hyperliquid + Lighter) en paralelo",
+        help="Lanzar Hyperliquid + Lighter",
+    )
+    parser.add_argument(
+        "--all-executors", action="store_true",
+        help="Lanzar TODOS los executors disponibles",
     )
 
     args = parser.parse_args()
@@ -542,24 +590,29 @@ ejemplos:
         args.enable_executor = not args.no_executor
 
     # Resolve executor target
-    if args.both_executors:
-        args.executor_target = "both"
-    elif args.lighter:
-        args.executor_target = "lighter"
+    args.executor_targets = []
+    if args.all_executors:
+        args.executor_targets = ["hl", "lighter", "hyena", "extended"]
+    elif args.both_executors:
+        args.executor_targets = ["hl", "lighter"]
     else:
-        args.executor_target = "hl"
+        if args.lighter: args.executor_targets.append("lighter")
+        if args.hyena: args.executor_targets.append("hyena")
+        if args.extended: args.executor_targets.append("extended")
+        if not args.executor_targets: args.executor_targets.append("hl")
 
     # Auto dry-run if no private keys for the selected executor(s)
     if args.enable_executor:
-        if args.executor_target == "hl" and not config.HL_PRIVATE_KEY:
+        all_keys_missing = True
+        for target in args.executor_targets:
+            if target == "hl" and config.HL_PRIVATE_KEY: all_keys_missing = False
+            if target == "lighter" and config.LIGHTER_API_KEY: all_keys_missing = False
+            if target == "hyena" and config.HYENA_PRIVATE_KEY: all_keys_missing = False
+            if target == "extended" and config.EXTENDED_API_KEY: all_keys_missing = False
+        
+        if all_keys_missing and not args.dry_run:
             args.dry_run = True
-            logger.info("HL_PRIVATE_KEY vacio — forzando --dry-run")
-        elif args.executor_target == "lighter" and not config.LIGHTER_API_KEY:
-            args.dry_run = True
-            logger.info("LIGHTER_API_KEY vacio — forzando --dry-run")
-        elif args.executor_target == "both" and not config.HL_PRIVATE_KEY and not config.LIGHTER_API_KEY:
-            args.dry_run = True
-            logger.info("Sin API keys — forzando --dry-run")
+            logger.info("No se detectaron API keys para los targets seleccionados — forzando --dry-run")
 
     orchestrator = Orchestrator(args)
 

@@ -102,7 +102,7 @@ class TradeJournal:
         await self._db.commit()
         trade_id = cursor.lastrowid
         logger.info("Journal OPEN #%d: %s %s %s size=%.6f @ $%.2f",
-                     trade_id, exchange, action, coin, size, entry_price)
+                     trade_id, exchange, action, coin, float(size), entry_price)
         return trade_id
 
     async def log_reentry(self, trade_id: int, price: float, size: float) -> None:
@@ -132,7 +132,7 @@ class TradeJournal:
         )
         await self._db.commit()
         logger.info("Journal REENTRY #%d: +%.6f @ $%.2f → total=%.6f @ $%.2f",
-                     trade_id, size, price, new_size, new_entry_price)
+                     trade_id, float(size), float(price), float(new_size), float(new_entry_price))
 
     async def log_close(self, trade_id: int, exit_price: float, reason: str) -> None:
         """Close a trade and compute PnL."""
@@ -163,7 +163,7 @@ class TradeJournal:
         )
         await self._db.commit()
         logger.info("Journal CLOSE #%d: exit=$%.2f | PnL=$%.2f | reason=%s",
-                     trade_id, exit_price, pnl, reason)
+                     trade_id, float(exit_price), float(pnl), reason)
 
     # ── Read operations ───────────────────────────────────────
 

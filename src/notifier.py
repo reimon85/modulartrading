@@ -172,7 +172,7 @@ class TelegramNotifier:
     ) -> None:
         """Rich notification for trade open / re-entry."""
         title = f"{action_label} {coin} @ ${price:,.2f}"
-        lines = [f"  Size: {size:f} {coin}"]
+        lines = [f"  Size: {size:.6f} {coin}"]
         if sl_price:
             tp_str = ""
             if tp_type == "PRICE" and tp_value:

@@ -36,58 +36,43 @@ async def run(args: argparse.Namespace) -> None:
         await client.connect()
         await redis_mgr.connect()
 
-        # Time range
-        now_ms = int(pd.Timestamp.now("UTC").timestamp() * 1000)
-        since_ms = now_ms - (args.days * 86_400_000)
+        timeframes = args.timeframe.split(",")
+        for tf in timeframes:
+            logger.info(f"--- Initial Sync: {args.symbol} @ {tf} ---")
+            # Time range
+            now_ms = int(pd.Timestamp.now("UTC").timestamp() * 1000)
+            since_ms = now_ms - (args.days * 86_400_000)
 
-        # 1. Fetch OHLCV -------------------------------------------------
-        df = await fetch_ohlcv(
-            client,
-            symbol=args.symbol,
-            timeframe=args.timeframe,
-            since=since_ms,
-            until=now_ms,
-        )
+            # 1. Fetch OHLCV
+            df = await fetch_ohlcv(
+                client,
+                symbol=args.symbol,
+                timeframe=tf,
+                since=since_ms,
+                until=now_ms,
+            )
 
-        if df.empty:
-            logger.error("No data returned — exiting")
-            return
+            if df.empty:
+                logger.warning(f"No data returned for {tf}")
+                continue
 
-        # 2. Supplementary data ------------------------------------------
-        funding_rate = await fetch_funding_rate(client, symbol=args.symbol)
-        spread_info = await fetch_spread(client, symbol=args.symbol)
+            # 2. Supplementary data (only for the first/main timeframe)
+            funding_rate = await fetch_funding_rate(client, symbol=args.symbol)
+            spread_info = await fetch_spread(client, symbol=args.symbol)
 
-        # 3. Enrich with IA-ready features -------------------------------
-        df = enrich(df, funding_rate=funding_rate, spread_info=spread_info)
+            # 3. Enrich
+            df = enrich(df, funding_rate=funding_rate, spread_info=spread_info)
 
-        # 4. Persist to Parquet + SQLite ---------------------------------
-        await save_parquet(df, symbol=args.symbol, timeframe=args.timeframe)
-        await save_sqlite(df, symbol=args.symbol, timeframe=args.timeframe)
+            # 4. Persist
+            await save_parquet(df, symbol=args.symbol, timeframe=tf)
+            await save_sqlite(df, symbol=args.symbol, timeframe=tf)
 
-        # 5. Push to Redis -----------------------------------------------
-        # 5a. Store last 100 candles in Sorted Set
-        last_100 = df.tail(100)
-        candles = last_100[["timestamp", "open", "high", "low", "close", "volume"]].to_dict("records")
-        await redis_mgr.store_candles(candles, timeframe=args.timeframe)
+            # 5. Push to Redis (full history requested)
+            candles = df[["timestamp", "open", "high", "low", "close", "volume"]].to_dict("records")
+            await redis_mgr.store_candles(candles, timeframe=tf)
+            logger.info(f"Stored {len(df)} candles for {tf} in Redis")
 
-        # 5b. Publish latest tick via Hash + Pub/Sub
-        latest = df.iloc[-1]
-        tick = {
-            "symbol": args.symbol,
-            "price": float(latest["close"]),
-            "open": float(latest["open"]),
-            "high": float(latest["high"]),
-            "low": float(latest["low"]),
-            "close": float(latest["close"]),
-            "volume": float(latest["volume"]),
-            "funding_rate": funding_rate,
-            "timestamp": int(latest["timestamp"]),
-        }
-        if spread_info:
-            tick.update(spread_info)
-        await redis_mgr.publish_tick(tick)
-
-        logger.info("Pipeline complete — %d enriched bars stored + Redis updated", len(df))
+        logger.info("Initial sync complete for all timeframes")
 
     finally:
         await client.close()

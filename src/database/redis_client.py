@@ -37,7 +37,7 @@ logger = logging.getLogger("data_fetcher.redis")
 TICKER_HASH_KEY = "ticker:btc_usdt:latest"
 OHLCV_ZSET_KEY = "ohlcv:btc_usdt:{timeframe}"
 PUBSUB_CHANNEL = "ticker:btc_usdt"
-MAX_CANDLES = 1000
+MAX_CANDLES = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +191,11 @@ class RedisManager:
         async def _do():
             pipe = self.client.pipeline(transaction=True)
             for candle in candles:
-                score = candle["timestamp"]
-                member = json.dumps(candle)
+                score = int(candle["timestamp"])
+                # Use sort_keys=True for deterministic JSON
+                member = json.dumps(candle, sort_keys=True)
+                # Ensure one member per score (timestamp)
+                pipe.zremrangebyscore(key, score, score)
                 pipe.zadd(key, {member: score})
 
             # Trim to keep only the latest MAX_CANDLES

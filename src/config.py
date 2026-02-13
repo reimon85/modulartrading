@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 # Load .env from project root
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 # ---------------------------------------------------------------------------
 # Exchange
@@ -35,6 +35,7 @@ TIMEFRAME_MS: dict[str, int] = {
     "5m": 300_000,
     "15m": 900_000,
     "30m": 1_800_000,
+    "45m": 2_700_000,
     "1h": 3_600_000,
     "2h": 7_200_000,
     "4h": 14_400_000,
@@ -85,6 +86,22 @@ STRATEGY_ENTRY_SIZE_BTC: float = float(os.getenv("STRATEGY_ENTRY_SIZE_BTC", "1.0
 LIGHTER_API_KEY: str = os.getenv("LIGHTER_API_KEY", "")
 LIGHTER_WALLET_ADDRESS: str = os.getenv("LIGHTER_WALLET_ADDRESS", "")
 LIGHTER_MAINNET: bool = os.getenv("LIGHTER_MAINNET", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# HyENA DEX (Hyperliquid HIP-3)
+# ---------------------------------------------------------------------------
+HYENA_PRIVATE_KEY: str = os.getenv("HYENA_PRIVATE_KEY", "")
+HYENA_WALLET_ADDRESS: str = os.getenv("HYENA_WALLET_ADDRESS", "")
+HYENA_MAINNET: bool = os.getenv("HYENA_MAINNET", "false").lower() == "true"
+HYENA_SIGNAL_CHANNEL: str = os.getenv("HYENA_SIGNAL_CHANNEL", "trading_signals")
+
+# ---------------------------------------------------------------------------
+# Extended (X10) DEX
+# ---------------------------------------------------------------------------
+EXTENDED_API_KEY: str = os.getenv("EXTENDED_API_KEY", "")
+EXTENDED_PRIVATE_KEY: str = os.getenv("EXTENDED_PRIVATE_KEY", "") # Starknet private key
+EXTENDED_VAULT_ID: str = os.getenv("EXTENDED_VAULT_ID", "")
+EXTENDED_MAINNET: bool = os.getenv("EXTENDED_MAINNET", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Storage paths

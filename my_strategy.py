@@ -71,7 +71,7 @@ class StrategyConfig:
     timeframe: str = "2h"
 
     # ── Motor en vivo ──────────────────────────────────────────
-    poll_interval: int = 100        # Segundos entre lecturas de Redis
+    poll_interval: int = 10         # Segundos entre lecturas de Redis
 
     # ── Alertas (dejar vacío para desactivar) ──────────────────
     discord_webhook: str = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -106,15 +106,6 @@ def _calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = np.where(avg_loss == 0, np.inf, avg_gain / avg_loss)
     return pd.Series(100 - (100 / (1 + rs)), index=series.index)
 
-def _calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range — útil como indicador extra de volatilidad."""
-    high_low = df["high"] - df["low"]
-    high_prev = (df["high"] - df["close"].shift(1)).abs()
-    low_prev = (df["low"] - df["close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_prev, low_prev], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-
 class CustomStrategy:
     """
     Motor de reglas.  Modifica check_signals() con tus condiciones.
@@ -129,17 +120,8 @@ class CustomStrategy:
     # ── Tus indicadores ────────────────────────────────────────
 
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Añade indicadores técnicos al DataFrame de velas."""
         df = df.copy()
-        """
-        Añade indicadores técnicos al DataFrame de velas.
-
-        Usa pandas/numpy puro (sin dependencias externas).
-        Para agregar uno nuevo, usa los helpers de abajo como ejemplo:
-
-            df["sma_50"]  = df["close"].rolling(50).mean()
-            df["bbu"]     = df["close"].rolling(20).mean() + 2 * df["close"].rolling(20).std()
-            df["atr"]     = _calc_atr(df, period=14)
-        """
         # --- Lógica de LAST UNHIT PIVOT y DAYLI BIAS ---
 # 1. Asegurar formato de fecha para agrupar correctamente
         df['dt'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
@@ -198,7 +180,7 @@ class CustomStrategy:
                 check_days = unique_days[past_idx + 1 : d_idx + 1]
                 touched = False
                 for cd in check_days:
-                    if daily_lows.get(cd, p_val + 1) <= p_val <= daily_highs.get(cd, p_val - 1):
+                    if daily_lows.get(cd, p_val - 1) <= p_val <= daily_highs.get(cd, p_val + 1):
                         touched = True
                         break
 
@@ -333,28 +315,6 @@ class CustomStrategy:
         snap = _snapshot(df.iloc[-1])
         snap["signal"] = signal
         return signal, reason, snap
-
-
-# ── Indicator helpers (pandas puro, sin dependencias externas) ────
-
-    def _calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-        """RSI de Wilder: media exponencial de ganancias vs pérdidas."""
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        # Handle division by zero: if avg_loss is 0, rs should be np.inf
-        rs = np.where(avg_loss == 0, np.inf, avg_gain / avg_loss)
-        return 100 - (100 / (1 + rs))
-
-def _calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range — útil como indicador extra de volatilidad."""
-    high_low = df["high"] - df["low"]
-    high_prev = (df["high"] - df["close"].shift(1)).abs()
-    low_prev = (df["low"] - df["close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_prev, low_prev], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -588,6 +548,11 @@ class StrategyRunner:
     ) -> None:
         """Publica señal al canal Redis para que el executor la reciba."""
         price = snap.get("price") or 0.0
+
+        if not price or not np.isfinite(price):
+            logger.error("Precio inválido (%.4s) — señal %s descartada", price, signal)
+            return
+
         is_buy = signal == "BUY"
 
         if is_buy:
@@ -608,6 +573,12 @@ class StrategyRunner:
             "size": float(config.STRATEGY_ENTRY_SIZE_BTC),
             "max_entries": int(config.STRATEGY_MAX_ENTRIES),
         }
+
+        # Guardia final: rechazar si algún valor numérico es NaN/Inf
+        for key in ("sl_price", "tp_value", "size"):
+            if not np.isfinite(payload[key]):
+                logger.error("Payload con %s=%s — señal descartada", key, payload[key])
+                return
 
         notifier = TelegramNotifier()
         try:

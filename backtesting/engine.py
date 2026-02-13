@@ -200,6 +200,8 @@ class BacktestEngine:
         timeframe: str = "1m",
         tp_points: float = 0.0,
         sl_points: float = 0.0,
+        max_entries: int = 1,
+        fixed_size_units: float | None = None,
     ):
         """
         Args:
@@ -207,10 +209,12 @@ class BacktestEngine:
             data:            DataFrame con OHLCV
             initial_capital: capital inicial en USDT
             commission_pct:  comisión por operación en % (0.1 = Binance spot)
-            position_frac:   fracción del cash a invertir por operación (1.0 = 100%)
+            position_frac:   fracción del cash a invertir por cada lote (ej: 0.25 si quieres 4 lotes)
             timeframe:       para anualizar Sharpe/Sortino
             tp_points:       Take Profit en puntos de precio (0 = desactivado)
             sl_points:       Stop Loss en puntos de precio (0 = desactivado)
+            max_entries:     máximo de lotes permitidos por operación
+            fixed_size_units: tamaño fijo en unidades (ej: 0.01 BTC) por lote. Si se usa, ignora position_frac.
         """
         self.strategy_cls = strategy_cls
         self.data = data.copy()
@@ -220,6 +224,8 @@ class BacktestEngine:
         self.timeframe = timeframe
         self.tp_points = tp_points
         self.sl_points = sl_points
+        self.max_entries = max_entries
+        self.fixed_size_units = fixed_size_units
 
     def run(self, params: dict) -> BacktestResult:
         """Ejecutar un backtest con los parámetros dados."""
@@ -245,6 +251,7 @@ class BacktestEngine:
         cash = self.initial_capital
         holdings = 0.0
         active_trade: Trade | None = None
+        num_entries = 0
 
         trades: list[Trade] = []
         equity_curve: list[float] = []
@@ -257,35 +264,58 @@ class BacktestEngine:
             ts = int(row["timestamp"])
 
             if i >= start:
-                # ── TP / SL CHECK (prioridad sobre señales) ───
+                # ── TP / SL CHECK (basado en precio promedio actual) ───
                 if active_trade is not None:
                     hi = float(row["high"])
                     lo = float(row["low"])
+                    
+                    is_long = active_trade.size > 0
+                    avg_px = active_trade.entry_price
 
-                    tp_hit = self.tp_points > 0 and hi >= active_trade.entry_price + self.tp_points
-                    sl_hit = self.sl_points > 0 and lo <= active_trade.entry_price - self.sl_points
+                    tp_hit = False
+                    sl_hit = False
+                    
+                    if is_long:
+                        tp_hit = self.tp_points > 0 and hi >= avg_px + self.tp_points
+                        sl_hit = self.sl_points > 0 and lo <= avg_px - self.sl_points
+                    else:
+                        tp_hit = self.tp_points > 0 and lo <= avg_px - self.tp_points
+                        sl_hit = self.sl_points > 0 and hi >= avg_px + self.sl_points
 
                     if tp_hit or sl_hit:
-                        exit_px = (
-                            (active_trade.entry_price + self.tp_points) if tp_hit
-                            else (active_trade.entry_price - self.sl_points)
-                        )
-                        revenue = holdings * exit_px
+                        exit_px = price # Por simplicidad en backtest usamos close, o el trigger
+                        if is_long:
+                            exit_px = (avg_px + self.tp_points) if tp_hit else (avg_px - self.sl_points)
+                        else:
+                            exit_px = (avg_px - self.tp_points) if tp_hit else (avg_px + self.sl_points)
+                            
+                        revenue = abs(holdings) * exit_px
                         fee = revenue * self.commission
-                        net = revenue - fee
+                        
+                        if is_long:
+                            pnl = (revenue - fee) - active_trade.invested
+                        else:
+                            pnl = (active_trade.invested - revenue) - fee
 
                         active_trade.exit_bar = i
                         active_trade.exit_timestamp = ts
                         active_trade.exit_price = exit_px
-                        active_trade.pnl = net - active_trade.invested
-                        active_trade.pnl_pct = (net / active_trade.invested - 1) * 100
+                        active_trade.pnl = pnl
+                        active_trade.pnl_pct = (pnl / active_trade.invested) * 100
                         active_trade.commission_paid += fee
                         active_trade.bars_held = i - active_trade.entry_bar
 
                         trades.append(active_trade)
-                        cash += net
+                        cash += active_trade.invested + pnl if is_long else active_trade.invested + pnl
+                        # Nota: el cash real disponible tras cerrar corto es capital_inicial_del_trade + pnl
+                        # pero aqui 'invested' es el valor nocional. Simplificamos:
+                        if not is_long:
+                            # Para cortos, el cash se incrementa por el profit neto
+                            cash = cash + (active_trade.invested / 1.0) + pnl - active_trade.invested
+                        
                         holdings = 0.0
                         active_trade = None
+                        num_entries = 0
 
                         equity_curve.append(cash)
                         timestamps.append(ts)
@@ -293,59 +323,138 @@ class BacktestEngine:
 
                 signal = strategy.check_signal(df, i)
 
-                # ── ABRIR LONG ─────────────────────────────────
-                if signal == "BUY" and active_trade is None and cash > 0:
-                    invest = cash * self.position_frac
-                    fee = invest * self.commission
-                    units = (invest - fee) / price
+                # ── GESTION DE ENTRADAS (NUEVA O DCA) ───────────────────
+                if signal in ("BUY", "SELL"):
+                    is_buy = signal == "BUY"
+                    
+                    # 1. Nueva Posición
+                    if active_trade is None:
+                        if self.fixed_size_units:
+                            units = self.fixed_size_units if is_buy else -self.fixed_size_units
+                            invest = abs(units) * price
+                        else:
+                            invest = self.initial_capital * self.position_frac
+                            units = (invest / (1 + self.commission)) / price if is_buy else -(invest / (1 + self.commission)) / price
+                            invest = abs(units) * price # Reajustar invested al valor nocional real
 
-                    cash -= invest
-                    holdings = units
-                    active_trade = Trade(
-                        entry_bar=i, entry_timestamp=ts,
-                        entry_price=price, size=units,
-                        invested=invest, commission_paid=fee,
-                    )
+                        fee = abs(units) * price * self.commission
+                        if cash >= invest + fee:
+                            # DEBUG SIZE
+                            # print(f"DEBUG NEW: Price {price:.1f} | Invest {invest:.1f} | Units {units:.4f}")
+                            
+                            cash -= (invest + fee)
+                            
+                            holdings = units
+                            active_trade = Trade(
+                                entry_bar=i, entry_timestamp=ts,
+                                entry_price=price, size=units,
+                                invested=invest, commission_paid=fee,
+                            )
+                            num_entries = 1
+                    
+                    # 2. Añadir lote (DCA)
+                    elif num_entries < self.max_entries:
+                        # Solo si la señal es del mismo sentido
+                        is_pos_long = active_trade.size > 0
+                        if is_buy == is_pos_long:
+                            if self.fixed_size_units:
+                                new_units = self.fixed_size_units if is_buy else -self.fixed_size_units
+                                invest = abs(new_units) * price
+                            else:
+                                invest = self.initial_capital * self.position_frac
+                                new_units = (invest / (1 + self.commission)) / price if is_buy else -(invest / (1 + self.commission)) / price
+                                invest = abs(new_units) * price
 
-                # ── CERRAR LONG ────────────────────────────────
-                elif signal == "SELL" and active_trade is not None:
-                    revenue = holdings * price
+                            fee = abs(new_units) * price * self.commission
+                            if cash >= invest + fee:
+                                # DEBUG DCA
+                                # print(f"DEBUG DCA {num_entries+1}: Price {price:.1f} | Invest {invest:.1f} | NewUnits {new_units:.4f} | TotalSize {active_trade.size + new_units:.4f}")
+                                
+                                # Recalcular precio promedio
+                                old_size = abs(active_trade.size)
+                                new_lot_size = abs(new_units)
+                                total_size = old_size + new_lot_size
+                                
+                                avg_px = (active_trade.entry_price * old_size + price * new_lot_size) / total_size
+                                
+                                cash -= (invest + fee)
+                                holdings += new_units
+                                active_trade.size += new_units
+                                active_trade.entry_price = avg_px
+                                active_trade.invested += invest
+                                active_trade.commission_paid += fee
+                                num_entries += 1
+                                # logger.debug(f"DCA Entry {num_entries} at {price}")
+
+                # ── CIERRE MANUAL POR SEÑAL OPUESTA ────────────────────
+                elif signal == "CLOSE" and active_trade is not None:
+                    revenue = abs(holdings) * price
                     fee = revenue * self.commission
-                    net = revenue - fee
+                    
+                    is_long = active_trade.size > 0
+                    if is_long:
+                        pnl = (revenue - fee) - active_trade.invested
+                        # Cash disponible = cash actual + revenue - fee
+                        cash += (revenue - fee)
+                    else:
+                        # Para corto: Profit = (Venta inicial - Compra cierre) - fees
+                        # PnL = (invested - revenue) - fee
+                        pnl = (active_trade.invested - revenue) - fee
+                        # Cash disponible = cash actual + (invested + pnl)
+                        cash += active_trade.invested + pnl
 
                     active_trade.exit_bar = i
                     active_trade.exit_timestamp = ts
                     active_trade.exit_price = price
-                    active_trade.pnl = net - active_trade.invested
-                    active_trade.pnl_pct = (net / active_trade.invested - 1) * 100
+                    active_trade.pnl = pnl
+                    active_trade.pnl_pct = (pnl / active_trade.invested) * 100
                     active_trade.commission_paid += fee
                     active_trade.bars_held = i - active_trade.entry_bar
 
                     trades.append(active_trade)
-                    cash += net
                     holdings = 0.0
                     active_trade = None
+                    num_entries = 0
 
-            equity_curve.append(cash + holdings * price)
+            # Update Equity
+            current_val = cash
+            if active_trade is not None:
+                is_long = active_trade.size > 0
+                if is_long:
+                    current_val += holdings * price
+                else:
+                    # PnL corto: (entry - current) * units
+                    unrealized_pnl = (active_trade.entry_price - price) * abs(holdings)
+                    current_val += active_trade.invested + unrealized_pnl
+                    
+            equity_curve.append(current_val)
             timestamps.append(ts)
 
         # ── Cierre forzado si hay posición abierta al final ────
         if active_trade is not None and len(df) > 0:
             last_price = float(df.iloc[-1]["close"])
             last_ts = int(df.iloc[-1]["timestamp"])
-            revenue = holdings * last_price
+            
+            revenue = abs(holdings) * last_price
             fee = revenue * self.commission
-            net = revenue - fee
+            
+            is_long = active_trade.size > 0
+            if is_long:
+                pnl = (revenue - fee) - active_trade.invested
+                cash += (revenue - fee)
+            else:
+                pnl = (active_trade.invested - revenue) - fee
+                cash += active_trade.invested + pnl
 
             active_trade.exit_bar = len(df) - 1
             active_trade.exit_timestamp = last_ts
             active_trade.exit_price = last_price
-            active_trade.pnl = net - active_trade.invested
-            active_trade.pnl_pct = (net / active_trade.invested - 1) * 100
+            active_trade.pnl = pnl
+            active_trade.pnl_pct = (pnl / active_trade.invested) * 100
             active_trade.commission_paid += fee
             active_trade.bars_held = len(df) - 1 - active_trade.entry_bar
             trades.append(active_trade)
-            equity_curve[-1] = cash + net
+            equity_curve[-1] = cash
 
         return trades, equity_curve, timestamps
 
